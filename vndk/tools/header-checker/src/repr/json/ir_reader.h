@@ -15,7 +15,6 @@
 #ifndef HEADER_CHECKER_REPR_JSON_IR_READER_H_
 #define HEADER_CHECKER_REPR_JSON_IR_READER_H_
 
-#include "repr/ir_dumper.h"
 #include "repr/ir_reader.h"
 #include "repr/ir_representation.h"
 
@@ -34,6 +33,8 @@ class JsonObjectRef {
   // The constructor sets ok to false if json_value is not an object.
   JsonObjectRef(const Json::Value &json_value, bool &ok);
 
+  bool IsMember(const std::string &key) const;
+
   // This method gets a value from the object and checks the type.
   // If the type mismatches, it sets ok_ to false and returns default value.
   // If the key doesn't exist, it doesn't change ok_ and returns default value.
@@ -46,8 +47,14 @@ class JsonObjectRef {
   // Default to 0.
   uint64_t GetUint(const std::string &key) const;
 
+  // Default to 0.
+  const Json::Value &GetIntegralValue(const std::string &key) const;
+
   // Default to "".
   std::string GetString(const std::string &key) const;
+
+  std::string GetString(const std::string &key,
+                        const std::string &default_value) const;
 
   // Default to {}.
   JsonObjectRef GetObject(const std::string &key) const;
@@ -113,8 +120,8 @@ template <> std::string JsonArrayRef<std::string>::Iterator::operator*() const;
 
 class JsonIRReader : public IRReader {
  public:
-  JsonIRReader(const std::set<std::string> *exported_headers)
-      : IRReader(exported_headers) {}
+  JsonIRReader(std::unique_ptr<ModuleIR> module_ir)
+      : IRReader(std::move(module_ir)) {}
 
  private:
   bool ReadDumpImpl(const std::string &dump_file) override;

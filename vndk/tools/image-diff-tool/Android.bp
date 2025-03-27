@@ -14,18 +14,14 @@
 // limitations under the License.
 //
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 python_binary_host {
     name: "compare_images",
     main: "diff.py",
     srcs: [
         "diff.py",
     ],
-    version: {
-        py2: {
-            enabled: false,
-        },
-        py3: {
-            enabled: true,
-        },
-    }
 }

@@ -16,6 +16,11 @@
 
 // We build two apps from the same source
 
+package {
+    default_team: "trendy_team_framework_backstage_power",
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 android_test {
     name: "DeviceAdminWhitelistedAccount",
     srcs: ["src/**/*.java"],

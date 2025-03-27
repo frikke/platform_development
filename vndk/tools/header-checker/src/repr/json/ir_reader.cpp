@@ -57,6 +57,10 @@ JsonObjectRef::JsonObjectRef(const Json::Value &json_value, bool &ok)
   }
 }
 
+bool JsonObjectRef::IsMember(const std::string &key) const {
+  return object_.isMember(key);
+}
+
 const Json::Value &
 JsonObjectRef::Get(const std::string &key, const Json::Value &default_value,
                    IsExpectedJsonType is_expected_type) const {
@@ -76,15 +80,26 @@ bool JsonObjectRef::GetBool(const std::string &key) const {
 }
 
 int64_t JsonObjectRef::GetInt(const std::string &key) const {
-  return Get(key, json_0, &Json::Value::isIntegral).asInt64();
+  return Get(key, json_0, &Json::Value::isInt64).asInt64();
 }
 
 uint64_t JsonObjectRef::GetUint(const std::string &key) const {
-  return Get(key, json_0, &Json::Value::isIntegral).asUInt64();
+  return Get(key, json_0, &Json::Value::isUInt64).asUInt64();
+}
+
+const Json::Value &JsonObjectRef::GetIntegralValue(
+    const std::string &key) const {
+  return Get(key, json_0, &Json::Value::isIntegral);
 }
 
 std::string JsonObjectRef::GetString(const std::string &key) const {
   return Get(key, json_empty_string, &Json::Value::isString).asString();
+}
+
+std::string JsonObjectRef::GetString(const std::string &key,
+                                     const std::string &default_value) const {
+  return Get(key, Json::Value(default_value), &Json::Value::isString)
+      .asString();
 }
 
 JsonObjectRef JsonObjectRef::GetObject(const std::string &key) const {
@@ -154,12 +169,13 @@ GetElfSymbolBinding(const JsonObjectRef &elf_symbol) {
 
 bool JsonIRReader::ReadDumpImpl(const std::string &dump_file) {
   Json::Value tu_json;
-  Json::Reader reader;
+  Json::CharReaderBuilder builder;
+  builder["collectComments"] = false;
   std::ifstream input(dump_file);
 
-  if (!reader.parse(input, tu_json, /* collectComments */ false)) {
-    llvm::errs() << "Failed to parse JSON: "
-                 << reader.getFormattedErrorMessages() << "\n";
+  std::string errorMessage;
+  if (!Json::parseFromStream(builder, input, &tu_json, &errorMessage)) {
+    llvm::errs() << "Failed to parse JSON: " << errorMessage << "\n";
     return false;
   }
   bool ok = true;
@@ -201,13 +217,36 @@ void JsonIRReader::ReadTemplateInfo(const JsonObjectRef &type_decl,
 
 void JsonIRReader::ReadTypeInfo(const JsonObjectRef &type_decl,
                                 TypeIR *type_ir) {
-  type_ir->SetLinkerSetKey(type_decl.GetString("linker_set_key"));
+  // LinkableMessageIR
   type_ir->SetSourceFile(type_decl.GetString("source_file"));
+  type_ir->SetLinkerSetKey(type_decl.GetString("linker_set_key"));
+  // TypeIR
   type_ir->SetName(type_decl.GetString("name"));
-  type_ir->SetReferencedType(type_decl.GetString("referenced_type"));
-  type_ir->SetSelfType(type_decl.GetString("self_type"));
   type_ir->SetSize(type_decl.GetUint("size"));
   type_ir->SetAlignment(type_decl.GetUint("alignment"));
+  type_ir->SetSelfType(
+      type_decl.GetString("self_type", type_ir->GetLinkerSetKey()));
+  // ReferencesOtherType
+  type_ir->SetReferencedType(
+      type_decl.GetString("referenced_type", type_ir->GetSelfType()));
+}
+
+static void ReadAvailabilityAttrs(const JsonObjectRef &object,
+                                  HasAvailabilityAttrs *decl_ir) {
+  for (auto &&attr : object.GetObjects("availability_attrs")) {
+    repr::AvailabilityAttrIR attr_ir;
+    if (attr.IsMember("introduced_major")) {
+      attr_ir.SetIntroduced(attr.GetUint("introduced_major"));
+    }
+    if (attr.IsMember("deprecated_major")) {
+      attr_ir.SetDeprecated(attr.GetUint("deprecated_major"));
+    }
+    if (attr.IsMember("obsoleted_major")) {
+      attr_ir.SetObsoleted(attr.GetUint("obsoleted_major"));
+    }
+    attr_ir.SetUnavailable(attr.GetBool("unavailable"));
+    decl_ir->AddAvailabilityAttr(std::move(attr_ir));
+  }
 }
 
 void JsonIRReader::ReadRecordFields(const JsonObjectRef &record_type,
@@ -215,7 +254,9 @@ void JsonIRReader::ReadRecordFields(const JsonObjectRef &record_type,
   for (auto &&field : record_type.GetObjects("fields")) {
     RecordFieldIR record_field_ir(
         field.GetString("field_name"), field.GetString("referenced_type"),
-        field.GetUint("field_offset"), GetAccess(field));
+        field.GetUint("field_offset"), GetAccess(field),
+        field.GetBool("is_bit_field"), field.GetUint("bit_width"));
+    ReadAvailabilityAttrs(field, &record_field_ir);
     record_ir->AddRecordField(std::move(record_field_ir));
   }
 }
@@ -247,8 +288,15 @@ void JsonIRReader::ReadVTableLayout(const JsonObjectRef &record_type,
 void JsonIRReader::ReadEnumFields(const JsonObjectRef &enum_type,
                                   EnumTypeIR *enum_ir) {
   for (auto &&field : enum_type.GetObjects("enum_fields")) {
-    EnumFieldIR enum_field_ir(field.GetString("name"),
-                              field.GetInt("enum_field_value"));
+    EnumFieldIR enum_field_ir;
+    enum_field_ir.SetName(field.GetString("name"));
+    const Json::Value &value = field.GetIntegralValue("enum_field_value");
+    if (value.isUInt64()) {
+      enum_field_ir.SetUnsignedValue(value.asUInt64());
+    } else {
+      enum_field_ir.SetSignedValue(value.asInt64());
+    }
+    ReadAvailabilityAttrs(field, &enum_field_ir);
     enum_ir->AddEnumField(std::move(enum_field_ir));
   }
 }
@@ -272,6 +320,7 @@ FunctionIR JsonIRReader::FunctionJsonToIR(const JsonObjectRef &function) {
   function_ir.SetSourceFile(function.GetString("source_file"));
   ReadFunctionParametersAndReturnType(function, &function_ir);
   ReadTemplateInfo(function, &function_ir);
+  ReadAvailabilityAttrs(function, &function_ir);
   return function_ir;
 }
 
@@ -294,6 +343,7 @@ JsonIRReader::RecordTypeJsonToIR(const JsonObjectRef &record_type) {
   ReadBaseSpecifiers(record_type, &record_type_ir);
   record_type_ir.SetRecordKind(GetRecordKind(record_type));
   record_type_ir.SetAnonymity(record_type.GetBool("is_anonymous"));
+  ReadAvailabilityAttrs(record_type, &record_type_ir);
   return record_type_ir;
 }
 
@@ -303,19 +353,24 @@ EnumTypeIR JsonIRReader::EnumTypeJsonToIR(const JsonObjectRef &enum_type) {
   enum_type_ir.SetUnderlyingType(enum_type.GetString("underlying_type"));
   enum_type_ir.SetAccess(GetAccess(enum_type));
   ReadEnumFields(enum_type, &enum_type_ir);
+  ReadAvailabilityAttrs(enum_type, &enum_type_ir);
   return enum_type_ir;
 }
 
 void JsonIRReader::ReadGlobalVariables(const JsonObjectRef &tu) {
   for (auto &&global_variable : tu.GetObjects("global_vars")) {
     GlobalVarIR global_variable_ir;
+    // GlobalVarIR
     global_variable_ir.SetName(global_variable.GetString("name"));
     global_variable_ir.SetAccess(GetAccess(global_variable));
+    // LinkableMessageIR
     global_variable_ir.SetSourceFile(global_variable.GetString("source_file"));
-    global_variable_ir.SetReferencedType(
-        global_variable.GetString("referenced_type"));
     global_variable_ir.SetLinkerSetKey(
         global_variable.GetString("linker_set_key"));
+    // ReferencesOtherType
+    global_variable_ir.SetReferencedType(global_variable.GetString(
+        "referenced_type", global_variable_ir.GetLinkerSetKey()));
+    ReadAvailabilityAttrs(global_variable, &global_variable_ir);
     module_->AddGlobalVariable(std::move(global_variable_ir));
   }
 }
@@ -354,6 +409,7 @@ void JsonIRReader::ReadArrayTypes(const JsonObjectRef &tu) {
   for (auto &&array_type : tu.GetObjects("array_types")) {
     ArrayTypeIR array_type_ir;
     ReadTypeInfo(array_type, &array_type_ir);
+    array_type_ir.SetUnknownBound(array_type.GetBool("is_of_unknown_bound"));
     module_->AddArrayType(std::move(array_type_ir));
   }
 }
@@ -419,8 +475,8 @@ void JsonIRReader::ReadElfObjects(const JsonObjectRef &tu) {
 }
 
 std::unique_ptr<IRReader> CreateJsonIRReader(
-    const std::set<std::string> *exported_headers) {
-  return std::make_unique<JsonIRReader>(exported_headers);
+    std::unique_ptr<ModuleIR> module_ir) {
+  return std::make_unique<JsonIRReader>(std::move(module_ir));
 }
 
 

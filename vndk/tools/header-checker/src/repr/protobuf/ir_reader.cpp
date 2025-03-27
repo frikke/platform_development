@@ -22,6 +22,7 @@
 #include <memory>
 
 #include <google/protobuf/text_format.h>
+#include <llvm/Support/raw_ostream.h>
 
 
 namespace header_checker {
@@ -37,6 +38,26 @@ void ProtobufIRReader::ReadTypeInfo(
   typep->SetSelfType(type_info.self_type());
   typep->SetSize(type_info.size());
   typep->SetAlignment(type_info.alignment());
+}
+
+static void ReadAvailabilityAttrs(
+    const google::protobuf::RepeatedPtrField<abi_dump::AvailabilityAttr>
+        &attrs_protobuf,
+    HasAvailabilityAttrs *decl_ir) {
+  for (const abi_dump::AvailabilityAttr &attr_protobuf : attrs_protobuf) {
+    AvailabilityAttrIR attr;
+    if (attr_protobuf.has_introduced_major()) {
+      attr.SetIntroduced(attr_protobuf.introduced_major());
+    }
+    if (attr_protobuf.has_deprecated_major()) {
+      attr.SetDeprecated(attr_protobuf.deprecated_major());
+    }
+    if (attr_protobuf.has_obsoleted_major()) {
+      attr.SetObsoleted(attr_protobuf.obsoleted_major());
+    }
+    attr.SetUnavailable(attr_protobuf.unavailable());
+    decl_ir->AddAvailabilityAttr(std::move(attr));
+  }
 }
 
 bool ProtobufIRReader::ReadDumpImpl(const std::string &dump_file) {
@@ -104,6 +125,7 @@ FunctionIR ProtobufIRReader::FunctionProtobufToIR(
   // Set Template info
   function_ir.SetTemplateInfo(
       TemplateInfoProtobufToIR(function_protobuf.template_info()));
+  ReadAvailabilityAttrs(function_protobuf.availability_attrs(), &function_ir);
   return function_ir;
 }
 
@@ -133,9 +155,11 @@ std::vector<RecordFieldIR> ProtobufIRReader::RecordFieldsProtobufToIR(
     const google::protobuf::RepeatedPtrField<abi_dump::RecordFieldDecl> &rfp) {
   std::vector<RecordFieldIR> record_type_fields_ir;
   for (auto &&field : rfp) {
-    RecordFieldIR record_field_ir(field.field_name(), field.referenced_type(),
-                                  field.field_offset(),
-                                  AccessProtobufToIR(field.access()));
+    RecordFieldIR record_field_ir(
+        field.field_name(), field.referenced_type(), field.field_offset(),
+        AccessProtobufToIR(field.access()), field.is_bit_field(),
+        field.bit_width());
+    ReadAvailabilityAttrs(field.availability_attrs(), &record_field_ir);
     record_type_fields_ir.emplace_back(std::move(record_field_ir));
   }
   return record_type_fields_ir;
@@ -172,6 +196,8 @@ RecordTypeIR ProtobufIRReader::RecordTypeProtobufToIR(
   record_type_ir.SetRecordKind(
       RecordKindProtobufToIR(record_type_protobuf.record_kind()));
   record_type_ir.SetAnonymity(record_type_protobuf.is_anonymous());
+  ReadAvailabilityAttrs(record_type_protobuf.availability_attrs(),
+                        &record_type_ir);
   return record_type_ir;
 }
 
@@ -179,7 +205,11 @@ std::vector<EnumFieldIR> ProtobufIRReader::EnumFieldsProtobufToIR(
     const google::protobuf::RepeatedPtrField<abi_dump::EnumFieldDecl> &efp) {
   std::vector<EnumFieldIR> enum_type_fields_ir;
   for (auto &&field : efp) {
-    EnumFieldIR enum_field_ir(field.name(), field.enum_field_value());
+    EnumFieldIR enum_field_ir;
+    enum_field_ir.SetName(field.name());
+    // enum_field_value is declared as int64.
+    enum_field_ir.SetSignedValue(field.enum_field_value());
+    ReadAvailabilityAttrs(field.availability_attrs(), &enum_field_ir);
     enum_type_fields_ir.emplace_back(std::move(enum_field_ir));
   }
   return enum_type_fields_ir;
@@ -193,6 +223,7 @@ EnumTypeIR ProtobufIRReader::EnumTypeProtobufToIR(
   enum_type_ir.SetAccess(AccessProtobufToIR(enum_type_protobuf.access()));
   enum_type_ir.SetFields(
       EnumFieldsProtobufToIR(enum_type_protobuf.enum_fields()));
+  ReadAvailabilityAttrs(enum_type_protobuf.availability_attrs(), &enum_type_ir);
   return enum_type_ir;
 }
 
@@ -207,6 +238,8 @@ void ProtobufIRReader::ReadGlobalVariables(
         global_variable_protobuf.referenced_type());
     global_variable_ir.SetLinkerSetKey(
         global_variable_protobuf.linker_set_key());
+    ReadAvailabilityAttrs(global_variable_protobuf.availability_attrs(),
+                          &global_variable_ir);
     module_->AddGlobalVariable(std::move(global_variable_ir));
   }
 }
@@ -245,6 +278,7 @@ void ProtobufIRReader::ReadArrayTypes(const abi_dump::TranslationUnit &tu) {
   for (auto &&array_type_protobuf : tu.array_types()) {
     ArrayTypeIR array_type_ir;
     ReadTypeInfo(array_type_protobuf.type_info(), &array_type_ir);
+    array_type_ir.SetUnknownBound(array_type_protobuf.is_of_unknown_bound());
     module_->AddArrayType(std::move(array_type_ir));
   }
 }
@@ -316,8 +350,8 @@ void ProtobufIRReader::ReadElfObjects(const abi_dump::TranslationUnit &tu) {
 }
 
 std::unique_ptr<IRReader> CreateProtobufIRReader(
-    const std::set<std::string> *exported_headers) {
-  return std::make_unique<ProtobufIRReader>(exported_headers);
+    std::unique_ptr<ModuleIR> module_ir) {
+  return std::make_unique<ProtobufIRReader>(std::move(module_ir));
 }
 
 

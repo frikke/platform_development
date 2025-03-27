@@ -31,9 +31,9 @@ except ImportError:
     from urllib2 import HTTPError  # PY2
 
 from gerrit import (
-    abandon, add_reviewers, create_url_opener_from_args, delete_reviewer,
-    delete_topic, find_gerrit_name, query_change_lists, set_hashtags,
-    set_review, set_topic, submit
+    abandon, add_common_parse_args, add_reviewers, create_url_opener_from_args,
+    delete, delete_reviewer, delete_topic, find_gerrit_name, normalize_gerrit_name,
+    query_change_lists, restore, set_hashtags, set_review, set_topic, submit
 )
 
 
@@ -86,15 +86,7 @@ def _confirm(question):
 def _parse_args():
     """Parse command line options."""
     parser = argparse.ArgumentParser()
-
-    parser.add_argument('query', help='Change list query string')
-    parser.add_argument('-g', '--gerrit', help='Gerrit review URL')
-
-    parser.add_argument('--gitcookies',
-                        default=os.path.expanduser('~/.gitcookies'),
-                        help='Gerrit cookie file')
-    parser.add_argument('--limits', default=1000,
-                        help='Max number of change lists')
+    add_common_parse_args(parser)
 
     parser.add_argument('-l', '--label', nargs=2, action='append',
                         help='Labels to be added')
@@ -103,6 +95,8 @@ def _parse_args():
     parser.add_argument('--submit', action='store_true', help='Submit a CL')
 
     parser.add_argument('--abandon', help='Abandon a CL with a message')
+    parser.add_argument('--restore', action='store_true', help='Restore a CL')
+    parser.add_argument('--delete', action='store_true', help='Delete a CL')
 
     parser.add_argument('--add-hashtag', action='append', help='Add hashtag')
     parser.add_argument('--remove-hashtag', action='append',
@@ -130,6 +124,10 @@ def _has_task(args):
     if args.submit:
         return True
     if args.abandon is not None:
+        return True
+    if args.restore:
+        return True
+    if args.delete:
         return True
     if args.add_hashtag or args.remove_hashtag:
         return True
@@ -188,7 +186,9 @@ def main():
     # Parse and check the command line options
     args = _parse_args()
 
-    if not args.gerrit:
+    if args.gerrit:
+        args.gerrit = normalize_gerrit_name(args.gerrit)
+    else:
         try:
             args.gerrit = find_gerrit_name()
         # pylint: disable=bare-except
@@ -197,9 +197,9 @@ def main():
             sys.exit(1)
 
     if not _has_task(args):
-        print('error: Either --label, --message, --submit, --abandon, '
+        print('error: Either --label, --message, --submit, --abandon, --restore, '
               '--add-hashtag, --remove-hashtag, --set-topic, --delete-topic, '
-              '--add-reviewer or --delete-reviewer must be specified',
+              '--add-reviewer, --delete-reviewer or --delete must be specified',
               file=sys.stderr)
         sys.exit(1)
 
@@ -214,7 +214,7 @@ def main():
 
     # Retrieve change lists
     change_lists = query_change_lists(
-        url_opener, args.gerrit, args.query, args.limits)
+        url_opener, args.gerrit, args.query, args.start, args.limits)
     if not change_lists:
         print('error: No matching change lists.', file=sys.stderr)
         sys.exit(1)
@@ -247,6 +247,12 @@ def main():
         if args.abandon:
             _do_task(change, abandon, url_opener, args.gerrit, change['id'],
                      args.abandon, errors=errors)
+        if args.restore:
+            _do_task(change, restore, url_opener, args.gerrit, change['id'],
+                     errors=errors)
+        if args.delete:
+            _do_task(change, delete, url_opener, args.gerrit, change['id'],
+                     errors=errors)
         if args.add_reviewer:
             _do_task(change, add_reviewers, url_opener, args.gerrit,
                      change['id'], new_reviewers, errors=errors)

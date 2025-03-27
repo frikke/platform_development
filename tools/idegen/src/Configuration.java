@@ -18,6 +18,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.BufferedReader;
 import java.io.FileReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -47,6 +49,9 @@ public class Configuration {
 
     /** File name used for excluded path files. */
     private static final String EXCLUDED_PATHS = "excluded-paths";
+
+    /** The vendor directory. */
+    private static final String VENDOR_PATH = "./vendor/";
 
     /**
      * Constructs a Configuration by traversing the directory tree, looking
@@ -91,12 +96,8 @@ public class Configuration {
         File globalExcludes = new File(toolDirectory, EXCLUDED_PATHS);
         parseFile(globalExcludes, patterns);
 
-        // Look for Google-specific excludes.
-        // TODO: Traverse all vendor-specific directories.
-        File googleExcludes = new File("./vendor/google/" + EXCLUDED_PATHS);
-        if (googleExcludes.exists()) {
-            parseFile(googleExcludes, patterns);
-        }
+        // Traverse all vendor-specific directories
+        readVendorExcludes(patterns);
 
         // Look for user-specific excluded-paths file in current directory.
         File localExcludes = new File(EXCLUDED_PATHS);
@@ -105,6 +106,23 @@ public class Configuration {
         }
 
         return new Excludes(patterns);
+    }
+
+    /**
+     * Reads vendor excluded path files.
+     * @see #readExcludes()
+     */
+    private static void readVendorExcludes(List<Pattern> out) throws IOException {
+        File vendorDir = new File(VENDOR_PATH);
+        File[] vendorList;
+        if (!vendorDir.exists() || (vendorList = vendorDir.listFiles()) == null) return;
+        for (File vendor : vendorList) {
+            File vendorExcludes = new File(vendor, EXCLUDED_PATHS);
+            if (vendorExcludes.exists()) {
+                Log.info("Read vendor excludes: " + vendorExcludes.getPath());
+                parseFile(vendorExcludes, out);
+            }
+        }
     }
 
     /**
@@ -135,6 +153,17 @@ public class Configuration {
             if (!file.exists()) {
                 Log.debug("Skipped nonexistent: " + path);
                 continue;
+            }
+
+            if (Files.isSymbolicLink(file.toPath())) {
+                Path target = Files.readSymbolicLink(file.toPath()).normalize();
+                if (target.startsWith("") || target.startsWith(".")
+                    || target.startsWith("..")) {
+                    // Don't recurse symbolic link that targets to parent
+                    // or current directory.
+                    Log.debug("Skipped: " + path);
+                    continue;
+                }
             }
 
             if (file.isDirectory()) {
@@ -200,8 +229,7 @@ public class Configuration {
      * found.
      */
     private static String parsePackageName(File file) throws IOException {
-        BufferedReader in = new BufferedReader(new FileReader(file));
-        try {
+        try (BufferedReader in = new BufferedReader(new FileReader(file))) {
             String line;
             while ((line = in.readLine()) != null) {
                 String trimmed = line.trim();
@@ -214,8 +242,6 @@ public class Configuration {
             }
 
             return null;
-        } finally {
-            in.close();
         }
     }
 
@@ -250,8 +276,7 @@ public class Configuration {
      */
     public static void parseFile(File file, Collection<Pattern> patterns)
             throws IOException {
-        BufferedReader in = new BufferedReader(new FileReader(file));
-        try {
+        try (BufferedReader in = new BufferedReader(new FileReader(file))) {
             String line;
             while ((line = in.readLine()) != null) {
                 String trimmed = line.trim();
@@ -259,8 +284,6 @@ public class Configuration {
                     patterns.add(Pattern.compile(trimmed));
                 }
             }
-        } finally {
-            in.close();
         }
     }
 }

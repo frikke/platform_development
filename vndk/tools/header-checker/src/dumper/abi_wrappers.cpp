@@ -69,7 +69,7 @@ ABIWrapper::ABIWrapper(
 
 std::string ABIWrapper::GetDeclSourceFile(const clang::Decl *decl,
                                           const clang::CompilerInstance *cip,
-                                          const std::string &root_dir) {
+                                          const utils::RootDirs &root_dirs) {
   clang::SourceManager &sm = cip->getSourceManager();
   clang::SourceLocation location = decl->getLocation();
   // We need to use the expansion location to identify whether we should recurse
@@ -80,7 +80,7 @@ std::string ABIWrapper::GetDeclSourceFile(const clang::Decl *decl,
   // belonging to the library.
   clang::SourceLocation expansion_location = sm.getExpansionLoc(location);
   return utils::NormalizePath(sm.getFilename(expansion_location).str(),
-                              root_dir);
+                              root_dirs);
 }
 
 std::string ABIWrapper::GetCachedDeclSourceFile(
@@ -88,7 +88,7 @@ std::string ABIWrapper::GetCachedDeclSourceFile(
   assert(decl != nullptr);
   auto result = ast_caches_->decl_to_source_file_cache_.find(decl);
   if (result == ast_caches_->decl_to_source_file_cache_.end()) {
-    return GetDeclSourceFile(decl, cip, ast_caches_->root_dir_);
+    return GetDeclSourceFile(decl, cip, ast_caches_->root_dirs_);
   }
   return result->second;
 }
@@ -138,6 +138,32 @@ bool ABIWrapper::SetupFunctionParameter(
   functionp->AddParameter(repr::ParamIR(
       GetTypeUniqueId(qual_type), has_default_arg, is_this_ptr));
   return true;
+}
+
+void ABIWrapper::SetupAvailabilityAttrs(repr::HasAvailabilityAttrs *decl_ir,
+                                        const clang::Decl *decl) {
+  for (const clang::AvailabilityAttr *attr :
+       decl->specific_attrs<clang::AvailabilityAttr>()) {
+    if (attr->getPlatform()->getName() !=
+        ast_contextp_->getTargetInfo().getPlatformName()) {
+      continue;
+    }
+    repr::AvailabilityAttrIR attr_ir;
+    clang::VersionTuple introduced = attr->getIntroduced();
+    if (!introduced.empty()) {
+      attr_ir.SetIntroduced(introduced.getMajor());
+    }
+    clang::VersionTuple deprecated = attr->getDeprecated();
+    if (!deprecated.empty()) {
+      attr_ir.SetDeprecated(deprecated.getMajor());
+    }
+    clang::VersionTuple obsoleted = attr->getObsoleted();
+    if (!obsoleted.empty()) {
+      attr_ir.SetObsoleted(obsoleted.getMajor());
+    }
+    attr_ir.SetUnavailable(attr->getUnavailable());
+    decl_ir->AddAvailabilityAttr(std::move(attr_ir));
+  }
 }
 
 static const clang::RecordDecl *GetAnonymousRecord(clang::QualType type) {
@@ -233,7 +259,7 @@ static std::string GetAnonymousEnumUniqueId(llvm::StringRef mangled_name,
     const std::ssub_match &old_name = match_result[1];
     old_suffix = std::to_string(old_name.length()) + match_result[0].str();
     nested_name_suffix = match_result[2].str();
-    if (!mangled_name.endswith(old_suffix)) {
+    if (!mangled_name.ends_with(old_suffix)) {
       llvm::errs() << "Unexpected length of anonymous enum type name: "
                    << mangled_name << "\n";
       ::exit(1);
@@ -294,10 +320,9 @@ bool ABIWrapper::CreateBasicNamedAndTypedDecl(
   // Temporary hack: Skip the auto types, incomplete types and dependent types.
   if (type_class != clang::Type::Auto && !base_type->isIncompleteType() &&
       !base_type->isDependentType()) {
-    std::pair<clang::CharUnits, clang::CharUnits> size_and_alignment =
-        ast_contextp_->getTypeInfoInChars(canonical_type);
-    typep->SetSize(size_and_alignment.first.getQuantity());
-    typep->SetAlignment(size_and_alignment.second.getQuantity());
+    auto type_info_chars = ast_contextp_->getTypeInfoInChars(canonical_type);
+    typep->SetSize(type_info_chars.Width.getQuantity());
+    typep->SetAlignment(type_info_chars.Align.getQuantity());
   }
 
   std::string human_name = QualTypeToString(canonical_type);
@@ -386,6 +411,7 @@ TypeAndCreationStatus ABIWrapper::SetTypeKind(
   }
   if (type_ptr->isArrayType()) {
     auto array_type_ir = std::make_unique<repr::ArrayTypeIR>();
+    array_type_ir->SetUnknownBound(type_ptr->isIncompleteArrayType());
     array_type_ir->SetSourceFile(source_file);
     return TypeAndCreationStatus(std::move(array_type_ir));
   }
@@ -543,6 +569,7 @@ bool FunctionDeclWrapper::SetupFunction(repr::FunctionIR *functionp,
 
   functionp->SetReturnType(GetTypeUniqueId(return_type));
   functionp->SetAccess(AccessClangToIR(function_decl_->getAccess()));
+  SetupAvailabilityAttrs(functionp, function_decl_);
   return CreateBasicNamedAndTypedDecl(return_type, source_file) &&
       SetupFunctionParameters(functionp, source_file) &&
       SetupTemplateInfo(functionp, source_file);
@@ -605,9 +632,13 @@ bool RecordDeclWrapper::SetupRecordFields(repr::RecordTypeIR *recordp,
     }
     std::string field_name(field->getName());
     uint64_t field_offset = record_layout.getFieldOffset(field_index);
-    recordp->AddRecordField(repr::RecordFieldIR(
+    uint64_t bit_width =
+        field->isBitField() ? field->getBitWidthValue(*ast_contextp_) : 0;
+    repr::RecordFieldIR record_field_ir(
         field_name, GetTypeUniqueId(field_type), field_offset,
-        AccessClangToIR(field->getAccess())));
+        AccessClangToIR(field->getAccess()), field->isBitField(), bit_width);
+    SetupAvailabilityAttrs(&record_field_ir, *field);
+    recordp->AddRecordField(std::move(record_field_ir));
     field++;
     field_index++;
   }
@@ -718,14 +749,15 @@ repr::VTableComponentIR RecordDeclWrapper::SetupRecordVTableComponent(
         const clang::CXXMethodDecl *method_decl =
             vtable_component.getFunctionDecl();
         assert(method_decl != nullptr);
-        is_pure = method_decl->isPure();
+        is_pure = method_decl->isPureVirtual();
         switch (clang_component_kind) {
           case clang::VTableComponent::CK_FunctionPointer:
             kind = repr::VTableComponentIR::Kind::FunctionPointer;
             if (thunk_info.isEmpty()) {
               mangle_contextp_->mangleName(method_decl, ostream);
             } else {
-              mangle_contextp_->mangleThunk(method_decl, thunk_info, ostream);
+              mangle_contextp_->mangleThunk(
+                  method_decl, thunk_info, /*ElideOverrideInfo=*/true, ostream);
             }
             ostream.flush();
             break;
@@ -749,7 +781,7 @@ repr::VTableComponentIR RecordDeclWrapper::SetupRecordVTableComponent(
               } else {
                 mangle_contextp_->mangleCXXDtorThunk(
                     vtable_component.getDestructorDecl(), dtor_type,
-                    thunk_info.This, ostream);
+                    thunk_info, /*ElideOverrideInfo=*/true, ostream);
               }
               ostream.flush();
             }
@@ -817,6 +849,7 @@ bool RecordDeclWrapper::SetupRecordInfo(repr::RecordTypeIR *record_declp,
     record_declp->SetAnonymity(true);
   }
   record_declp->SetAccess(AccessClangToIR(record_decl_->getAccess()));
+  SetupAvailabilityAttrs(record_declp, record_decl_);
   return SetupRecordFields(record_declp, source_file) &&
       SetupCXXRecordInfo(record_declp, source_file);
 }
@@ -881,9 +914,16 @@ bool EnumDeclWrapper::SetupEnumFields(repr::EnumTypeIR *enump) {
   }
   clang::EnumDecl::enumerator_iterator enum_it = enum_decl_->enumerator_begin();
   while (enum_it != enum_decl_->enumerator_end()) {
-    std::string name = enum_it->getQualifiedNameAsString();
-    uint64_t field_value = enum_it->getInitVal().getExtValue();
-    enump->AddEnumField(repr::EnumFieldIR(name, field_value));
+    repr::EnumFieldIR enum_field_ir;
+    enum_field_ir.SetName(enum_it->getQualifiedNameAsString());
+    const llvm::APSInt &value = enum_it->getInitVal();
+    if (value.isUnsigned()) {
+      enum_field_ir.SetUnsignedValue(value.getZExtValue());
+    } else {
+      enum_field_ir.SetSignedValue(value.getSExtValue());
+    }
+    SetupAvailabilityAttrs(&enum_field_ir, *enum_it);
+    enump->AddEnumField(std::move(enum_field_ir));
     enum_it++;
   }
   return true;
@@ -899,6 +939,7 @@ bool EnumDeclWrapper::SetupEnum(repr::EnumTypeIR *enum_type,
   enum_type->SetSourceFile(source_file);
   enum_type->SetUnderlyingType(GetTypeUniqueId(enum_decl_->getIntegerType()));
   enum_type->SetAccess(AccessClangToIR(enum_decl_->getAccess()));
+  SetupAvailabilityAttrs(enum_type, enum_decl_);
   return SetupEnumFields(enum_type) &&
       CreateBasicNamedAndTypedDecl(enum_decl_->getIntegerType(), "");
 }
@@ -943,6 +984,7 @@ bool GlobalVarDeclWrapper::SetupGlobalVar(repr::GlobalVarIR *global_varp,
   global_varp->SetLinkerSetKey(mangled_name);
   global_varp->SetAccess(AccessClangToIR(global_var_decl_->getAccess()));
   global_varp->SetReferencedType(GetTypeUniqueId(global_var_decl_->getType()));
+  SetupAvailabilityAttrs(global_varp, global_var_decl_);
   return true;
 }
 

@@ -28,19 +28,47 @@ import sys
 import xml.dom.minidom
 
 try:
+    import ssl
+    _HAS_SSL = True
+except ImportError:
+    _HAS_SSL = False
+
+try:
     # PY3
     from urllib.error import HTTPError
     from urllib.parse import urlencode, urlparse
     from urllib.request import (
-        HTTPBasicAuthHandler, Request, build_opener
+        HTTPBasicAuthHandler, HTTPHandler, OpenerDirector, Request,
+        build_opener
     )
+    if _HAS_SSL:
+        from urllib.request import HTTPSHandler
 except ImportError:
     # PY2
     from urllib import urlencode
     from urllib2 import (
-        HTTPBasicAuthHandler, HTTPError, Request, build_opener
+        HTTPBasicAuthHandler, HTTPError, HTTPHandler, OpenerDirector, Request,
+        build_opener
     )
+    if _HAS_SSL:
+        from urllib2 import HTTPSHandler
     from urlparse import urlparse
+
+try:
+    from http.client import HTTPResponse
+except ImportError:
+    from httplib import HTTPResponse
+
+try:
+    from urllib import addinfourl
+    _HAS_ADD_INFO_URL = True
+except ImportError:
+    _HAS_ADD_INFO_URL = False
+
+try:
+    from io import BytesIO
+except ImportError:
+    from StringIO import StringIO as BytesIO
 
 try:
     # PY3.5
@@ -84,6 +112,107 @@ except ImportError:
         return CompletedProcess(args, returncode, stdout, stderr)
 
 
+class CurlSocket(object):
+    """A mock socket object that loads the response from a curl output file."""
+
+    def __init__(self, file_obj):
+        self._file_obj = file_obj
+
+    def makefile(self, *args):
+        return self._file_obj
+
+    def close(self):
+        self._file_obj = None
+
+
+def _build_curl_command_for_request(curl_command_name, req):
+    """Build the curl command line for an HTTP/HTTPS request."""
+
+    cmd = [curl_command_name]
+
+    # Adds `--no-progress-meter` to hide the progress bar.
+    cmd.append('--no-progress-meter')
+
+    # Adds `-i` to print the HTTP response headers to stdout.
+    cmd.append('-i')
+
+    # Uses HTTP 1.1.  The `http.client` module can only parse HTTP 1.1 headers.
+    cmd.append('--http1.1')
+
+    # Specifies the request method.
+    cmd.append('-X')
+    cmd.append(req.get_method())
+
+    # Adds the request headers.
+    for name, value in req.headers.items():
+        cmd.append('-H')
+        cmd.append(name + ': ' + value)
+
+    # Adds the request data.
+    if req.data:
+        cmd.append('-d')
+        cmd.append('@-')
+
+    # Adds the request full URL.
+    cmd.append(req.get_full_url())
+    return cmd
+
+
+def _handle_open_with_curl(curl_command_name, req):
+    """Send the HTTP request with CURL and return a response object that can be
+    handled by urllib."""
+
+    # Runs the curl command.
+    cmd = _build_curl_command_for_request(curl_command_name, req)
+    proc = run(cmd, stdout=PIPE, input=req.data, check=True)
+
+    # Wraps the curl output with a socket-like object.
+    outfile = BytesIO(proc.stdout)
+    socket = CurlSocket(outfile)
+
+    response = HTTPResponse(socket)
+    try:
+        # Parses the response header.
+        response.begin()
+    except:
+        response.close()
+        raise
+
+    # Overrides `Transfer-Encoding: chunked` because curl combines chunks.
+    response.chunked = False
+    response.chunk_left = None
+
+    if _HAS_ADD_INFO_URL:
+        # PY2 urllib2 expects a different return object.
+        result = addinfourl(outfile, response.msg, req.get_full_url())
+        result.code = response.status
+        result.msg = response.reason
+        return result
+
+    return response  # PY3
+
+
+class CurlHTTPHandler(HTTPHandler):
+    """CURL HTTP handler."""
+
+    def __init__(self, curl_command_name):
+        self._curl_command_name = curl_command_name
+
+    def http_open(self, req):
+        return _handle_open_with_curl(self._curl_command_name, req)
+
+
+if _HAS_SSL:
+    class CurlHTTPSHandler(HTTPSHandler):
+        """CURL HTTPS handler."""
+
+        def __init__(self, curl_command_name):
+            self._curl_command_name = curl_command_name
+
+        def https_open(self, req):
+            return _handle_open_with_curl(self._curl_command_name, req)
+
+
 def load_auth_credentials_from_file(cookie_file):
     """Load credentials from an opened .gitcookies file."""
     credentials = {}
@@ -117,13 +246,53 @@ def load_auth_credentials(cookie_file_path):
         return load_auth_credentials_from_file(cookie_file)
 
 
+def _domain_matches(domain_name, domain_pattern):
+    """Returns whether `domain_name` matches `domain_pattern` under the
+    definition of RFC 6265 (Section 4.1.2.3 and 5.1.3).
+
+    Pattern matching rule defined by Section 5.1.3:
+
+        >>> _domain_matches('example.com', 'example.com')
+        True
+        >>> _domain_matches('a.example.com', 'example.com')
+        True
+        >>> _domain_matches('aaaexample.com', 'example.com')
+        False
+
+    If the domain pattern starts with '.', '.' is ignored (Section 4.1.2.3):
+
+        >>> _domain_matches('a.example.com', '.example.com')
+        True
+        >>> _domain_matches('example.com', '.example.com')
+        True
+
+    See also:
+        https://datatracker.ietf.org/doc/html/rfc6265#section-4.1.2.3
+        https://datatracker.ietf.org/doc/html/rfc6265#section-5.1.3
+    """
+    domain_pattern = domain_pattern.removeprefix('.')
+    return (domain_name == domain_pattern or
+            (domain_name.endswith(domain_pattern) and
+             domain_name[-len(domain_pattern) - 1] == '.'))
+
+
+def _find_auth_credentials(credentials, domain):
+    """Find the first set of login credentials (username, password)
+    that `domain` matches.
+    """
+    for domain_pattern, login in credentials.items():
+        if _domain_matches(domain, domain_pattern):
+            return login
+    raise KeyError('Domain {} not found'.format(domain))
+
+
 def create_url_opener(cookie_file_path, domain):
     """Load username and password from .gitcookies and return a URL opener with
     an authentication handler."""
 
     # Load authentication credentials
     credentials = load_auth_credentials(cookie_file_path)
-    username, password = credentials[domain]
+    username, password = _find_auth_credentials(credentials, domain)
 
     # Create URL opener with authentication handler
     auth_handler = HTTPBasicAuthHandler()
@@ -133,6 +302,15 @@ def create_url_opener(cookie_file_path, domain):
 
 def create_url_opener_from_args(args):
     """Create URL opener from command line arguments."""
+
+    if args.use_curl:
+        handlers = []
+        handlers.append(CurlHTTPHandler(args.use_curl))
+        if _HAS_SSL:
+            handlers.append(CurlHTTPSHandler(args.use_curl))
+
+        opener = build_opener(*handlers)
+        return opener
 
     domain = urlparse(args.gerrit).netloc
 
@@ -171,13 +349,31 @@ def _decode_xssi_json(data):
     return json.loads(data)
 
 
-def query_change_lists(url_opener, gerrit, query_string, limits):
-    """Query change lists."""
+def _query_change_lists(url_opener, gerrit, query_string, start, count):
+    """Query change lists from the Gerrit server with a single request.
+
+    This function performs a single query of the Gerrit server based on the
+    input parameters for a list of changes.  The server may return less than
+    the number of changes requested.  The caller should check the last record
+    returned for the _more_changes attribute to determine if more changes are
+    available and perform additional queries adjusting the start index.
+
+    Args:
+        url_opener:  URL opener for request
+        gerrit: Gerrit server URL
+        query_string: Gerrit query string to select changes
+        start: Number of changes to be skipped from the beginning
+        count: Maximum number of changes to return
+
+    Returns:
+        List of changes
+    """
     data = [
         ('q', query_string),
         ('o', 'CURRENT_REVISION'),
         ('o', 'CURRENT_COMMIT'),
-        ('n', str(limits)),
+        ('start', str(start)),
+        ('n', str(count)),
     ]
     url = gerrit + '/a/changes/?' + urlencode(data)
 
@@ -186,6 +382,40 @@ def query_change_lists(url_opener, gerrit, query_string, limits):
         return _decode_xssi_json(response_file.read())
     finally:
         response_file.close()
+
+def query_change_lists(url_opener, gerrit, query_string, start, count):
+    """Query change lists from the Gerrit server.
+
+    This function queries the Gerrit server based on the input parameters for a
+    list of changes.  This function handles querying the server multiple times
+    if necessary and combining the results that are returned to the caller.
+
+    Args:
+        url_opener:  URL opener for request
+        gerrit: Gerrit server URL
+        query_string: Gerrit query string to select changes
+        start: Number of changes to be skipped from the beginning
+        count: Maximum number of changes to return
+
+    Returns:
+        List of changes
+    """
+    changes = []
+    while len(changes) < count:
+        chunk = _query_change_lists(url_opener, gerrit, query_string,
+                                    start + len(changes), count - len(changes))
+        if not chunk:
+            break
+
+        changes += chunk
+
+        # The last change object contains a _more_changes attribute if the
+        # number of changes exceeds the query parameter or the internal server
+        # limit.  Stop iteration if `_more_changes` attribute doesn't exist.
+        if '_more_changes' not in chunk[-1]:
+            break
+
+    return changes
 
 
 def _make_json_post_request(url_opener, url, data, method='POST'):
@@ -255,6 +485,22 @@ def abandon(url_opener, gerrit_url, change_id, message):
         data['message'] = message
 
     return _make_json_post_request(url_opener, url, data)
+
+
+def restore(url_opener, gerrit_url, change_id):
+    """Restore a change list."""
+
+    url = '{}/a/changes/{}/restore'.format(gerrit_url, change_id)
+
+    return _make_json_post_request(url_opener, url, {})
+
+
+def delete(url_opener, gerrit_url, change_id):
+    """Delete a change list."""
+
+    url = '{}/a/changes/{}'.format(gerrit_url, change_id)
+
+    return _make_json_post_request(url_opener, url, {}, method='DELETE')
 
 
 def set_topic(url_opener, gerrit_url, change_id, name):
@@ -338,27 +584,41 @@ def find_gerrit_name():
 
     raise ValueError('cannot find gerrit URL from manifest')
 
-def _parse_args():
-    """Parse command line options."""
-    parser = argparse.ArgumentParser()
+def normalize_gerrit_name(gerrit):
+    """Strip the trailing slashes because Gerrit will return 404 when there are
+    redundant trailing slashes."""
+    return gerrit.rstrip('/')
 
+def add_common_parse_args(parser):
     parser.add_argument('query', help='Change list query string')
     parser.add_argument('-g', '--gerrit', help='Gerrit review URL')
-
     parser.add_argument('--gitcookies',
                         default=os.path.expanduser('~/.gitcookies'),
                         help='Gerrit cookie file')
-    parser.add_argument('--limits', default=1000,
+    parser.add_argument('--limits', default=1000, type=int,
                         help='Max number of change lists')
+    parser.add_argument('--start', default=0, type=int,
+                        help='Skip first N changes in query')
+    parser.add_argument(
+        '--use-curl',
+        help='Send requests with the specified curl command (e.g. `curl`)')
 
+def _parse_args():
+    """Parse command line options."""
+    parser = argparse.ArgumentParser()
+    add_common_parse_args(parser)
+    parser.add_argument('--format', default='json',
+                        choices=['json', 'oneline', 'porcelain'],
+                        help='Print format')
     return parser.parse_args()
-
 
 def main():
     """Main function"""
     args = _parse_args()
 
-    if not args.gerrit:
+    if args.gerrit:
+        args.gerrit = normalize_gerrit_name(args.gerrit)
+    else:
         try:
             args.gerrit = find_gerrit_name()
         # pylint: disable=bare-except
@@ -369,11 +629,29 @@ def main():
     # Query change lists
     url_opener = create_url_opener_from_args(args)
     change_lists = query_change_lists(
-        url_opener, args.gerrit, args.query, args.limits)
+        url_opener, args.gerrit, args.query, args.start, args.limits)
 
     # Print the result
-    json.dump(change_lists, sys.stdout, indent=4, separators=(', ', ': '))
-    print()  # Print the end-of-line
+    if args.format == 'json':
+        json.dump(change_lists, sys.stdout, indent=4, separators=(', ', ': '))
+        print()  # Print the end-of-line
+    else:
+        if args.format == 'oneline':
+            format_str = ('{i:<8} {number:<16} {status:<20} '
+                          '{change_id:<60} {project:<120} '
+                          '{subject}')
+        else:
+            format_str = ('{i}\t{number}\t{status}\t'
+                          '{change_id}\t{project}\t{subject}')
+
+        for i, change in enumerate(change_lists):
+            print(format_str.format(i=i,
+                                    project=change['project'],
+                                    change_id=change['change_id'],
+                                    status=change['status'],
+                                    number=change['_number'],
+                                    subject=change['subject']))
+
 
 if __name__ == '__main__':
     main()

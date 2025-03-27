@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2013 The Android Open Source Project
 #
@@ -20,20 +20,29 @@ The information can include symbol names, offsets, and source locations.
 """
 
 import atexit
+import json
 import glob
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import unittest
 
-try:
-  ANDROID_BUILD_TOP = str(os.environ["ANDROID_BUILD_TOP"])
-  if not ANDROID_BUILD_TOP:
-    ANDROID_BUILD_TOP = "."
-except:
-  ANDROID_BUILD_TOP = "."
+ANDROID_BUILD_TOP = os.environ.get("ANDROID_BUILD_TOP", ".")
+
+
+def FindClangDir():
+  get_clang_version = ANDROID_BUILD_TOP + "/build/soong/scripts/get_clang_version.py"
+  if os.path.exists(get_clang_version):
+    # We want the script to fail if get_clang_version.py exists but is unable
+    # to find the clang version.
+    version_output = subprocess.check_output(get_clang_version, text=True)
+    return ANDROID_BUILD_TOP + "/prebuilts/clang/host/linux-x86/" + version_output.strip()
+  else:
+    return None
+
 
 def FindSymbolsDir():
   saveddir = os.getcwd()
@@ -41,8 +50,8 @@ def FindSymbolsDir():
   stream = None
   try:
     cmd = "build/soong/soong_ui.bash --dumpvar-mode --abs TARGET_OUT_UNSTRIPPED"
-    stream = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True).stdout
-    return os.path.join(ANDROID_BUILD_TOP, str(stream.read().strip()))
+    stream = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True, shell=True).stdout
+    return str(stream.read().strip())
   finally:
     if stream is not None:
         stream.close()
@@ -50,12 +59,12 @@ def FindSymbolsDir():
 
 SYMBOLS_DIR = FindSymbolsDir()
 
-ARCH = None
+ARCH_IS_32BIT = None
 
+VERBOSE = False
 
 # These are private. Do not access them from other modules.
 _CACHED_TOOLCHAIN = None
-_CACHED_TOOLCHAIN_ARCH = None
 _CACHED_CXX_FILT = None
 
 # Caches for symbolized information.
@@ -96,12 +105,14 @@ class ProcessCache:
     return pipe
 
   def SpawnProcess(self, cmd):
-     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
 
   def TerminateProcess(self, pipe):
-    pipe.stdin.close()
-    pipe.stdout.close()
-    pipe.terminate()
+    if pipe.poll() is None:
+      # Process is still running.
+      pipe.stdin.close()
+      pipe.stdout.close()
+      pipe.terminate()
     pipe.wait()
 
   def KillAllProcesses(self):
@@ -137,17 +148,19 @@ for sig in (signal.SIGABRT, signal.SIGINT, signal.SIGTERM):
 
 
 def ToolPath(tool, toolchain=None):
-  """Return a fully-qualified path to the specified tool"""
+  """Return a fully-qualified path to the specified tool, or just the tool if it's on PATH """
+  if shutil.which(tool):
+    return tool
   if not toolchain:
     toolchain = FindToolchain()
   return os.path.join(toolchain, tool)
 
 
 def FindToolchain():
-  """Returns the toolchain matching ARCH."""
+  """Returns the toolchain."""
 
-  global _CACHED_TOOLCHAIN, _CACHED_TOOLCHAIN_ARCH
-  if _CACHED_TOOLCHAIN is not None and _CACHED_TOOLCHAIN_ARCH == ARCH:
+  global _CACHED_TOOLCHAIN
+  if _CACHED_TOOLCHAIN:
     return _CACHED_TOOLCHAIN
 
   llvm_binutils_dir = ANDROID_BUILD_TOP + "/prebuilts/clang/host/linux-x86/llvm-binutils-stable/";
@@ -155,8 +168,7 @@ def FindToolchain():
     raise Exception("Could not find llvm tool chain directory %s" % (llvm_binutils_dir))
 
   _CACHED_TOOLCHAIN = llvm_binutils_dir
-  _CACHED_TOOLCHAIN_ARCH = ARCH
-  print("Using %s toolchain from: %s" % (_CACHED_TOOLCHAIN_ARCH, _CACHED_TOOLCHAIN))
+  print("Using toolchain from:", _CACHED_TOOLCHAIN)
   return _CACHED_TOOLCHAIN
 
 
@@ -231,6 +243,88 @@ def SymbolInformationForSet(lib, unique_addrs):
   return result
 
 
+def _OptionalStackRecordField(json_result, field):
+  """Fix up bizarre formatting of llvm-symbolizer output
+
+  Some parts of the FRAME output are output as a string containing a hex
+  integer, or the empty string when it's missing.
+
+  Args:
+    json_result: dictionary containing the Frame response
+    field: name of the field we want to read
+
+  Returns:
+    integer of field value, or None if missing
+  """
+  value = json_result.get(field, "")
+  if isinstance(value, int):
+    # Leaving this here in case someone decides to fix the types of the
+    # symbolizer output, so it's easier to roll out.
+    return value
+  if value != "":
+    return int(value, 16)
+  return None
+
+
+def _GetJSONSymbolizerForLib(lib, args=None):
+  """ Find symbol file for lib, and return a llvm-symbolizer instance for it.
+
+  Args:
+    lib: library (or executable) pathname containing symbols
+    args: (optional) list of arguments to pass to llvm-symbolizer
+
+  Returns:
+    child process, or None if lib not found
+  """
+  if args is None:
+    args = []
+  symbols = SYMBOLS_DIR + lib
+  if not os.path.exists(symbols):
+    symbols = lib
+    if not os.path.exists(symbols):
+      return None
+
+  # Make sure the symbols path is not a directory.
+  if os.path.isdir(symbols):
+    return None
+
+  cmd = [ToolPath("llvm-symbolizer"), "--output-style=JSON"] + args + ["--obj=" + symbols]
+  return _PIPE_ADDR2LINE_CACHE.GetProcess(cmd)
+
+
+def GetStackRecordsForSet(lib, unique_addrs):
+  """Look up stack record information for a set of addresses
+
+  Args:
+    lib: library (or executable) pathname containing symbols
+    unique_addrs: set of integer addresses look up.
+
+  Returns:
+    A list of tuples
+    (addr, function_name, local_name, file_line, frame_offset, size, tag_offset)
+    describing the local variables of the stack frame.
+    frame_offset, size, tag_offset may be None.
+  """
+  child = _GetJSONSymbolizerForLib(lib)
+  if child is None or child.poll() is not None:
+    return None
+  records = []
+  for addr in unique_addrs:
+    child.stdin.write("FRAME 0x%x\n" % addr)
+    child.stdin.flush()
+    json_result = json.loads(child.stdout.readline().strip())
+    for frame in json_result["Frame"]:
+      records.append(
+        (addr,
+        frame["FunctionName"],
+        frame["Name"],
+        frame["DeclFile"] + ":" + str(frame["DeclLine"]),
+        frame.get("FrameOffset"),
+        _OptionalStackRecordField(frame, "Size"),
+        _OptionalStackRecordField(frame, "TagOffset")))
+  return records
+
+
 def CallLlvmSymbolizerForSet(lib, unique_addrs):
   """Look up line and symbol information for a set of addresses.
 
@@ -272,59 +366,28 @@ def CallLlvmSymbolizerForSet(lib, unique_addrs):
     addr_cache = {}
     _SYMBOL_INFORMATION_ADDR2LINE_CACHE[lib] = addr_cache
 
-  symbols = SYMBOLS_DIR + lib
-  if not os.path.exists(symbols):
-    symbols = lib
-    if not os.path.exists(symbols):
-      return None
-
-  # Make sure the symbols path is not a directory.
-  if os.path.isdir(symbols):
+  child = _GetJSONSymbolizerForLib(
+    lib, ["--functions", "--inlines", "--demangle"])
+  if child is None:
     return None
-
-  cmd = [ToolPath("llvm-symbolizer"), "--functions", "--inlines",
-      "--demangle", "--obj=" + symbols, "--output-style=GNU"]
-  child = _PIPE_ADDR2LINE_CACHE.GetProcess(cmd)
-
   for addr in addrs:
     try:
       child.stdin.write("0x%s\n" % addr)
       child.stdin.flush()
       records = []
-      first = True
-      while True:
-        symbol = child.stdout.readline().strip()
-        if not symbol:
-          break
-        location = child.stdout.readline().strip()
-        records.append((symbol, location))
-        if first:
-          # Write a blank line as a sentinel so we know when to stop
-          # reading inlines from the output.
-          # The blank line will cause llvm-symbolizer to emit a blank line.
-          child.stdin.write("\n")
-          first = False
+      json_result = json.loads(child.stdout.readline().strip())
+      if "Symbol" in json_result:
+        for symbol in json_result["Symbol"]:
+          function_name = symbol["FunctionName"]
+          # GNU style location: file_name:line_num
+          location = ("%s:%s" % (symbol["FileName"], symbol["Line"]))
+          records.append((function_name, location))
     except IOError as e:
       # Remove the / in front of the library name to match other output.
       records = [(None, lib[1:] + "  ***Error: " + str(e))]
     result[addr] = records
     addr_cache[addr] = records
   return result
-
-
-def StripPC(addr):
-  """Strips the Thumb bit a program counter address when appropriate.
-
-  Args:
-    addr: the program counter address
-
-  Returns:
-    The stripped program counter address.
-  """
-  global ARCH
-  if ARCH == "arm":
-    return addr & ~1
-  return addr
 
 
 def CallObjdumpForSet(lib, unique_addrs):
@@ -369,8 +432,8 @@ def CallObjdumpForSet(lib, unique_addrs):
     if not os.path.exists(symbols):
       return None
 
-  start_addr_dec = str(StripPC(int(addrs[0], 16)))
-  stop_addr_dec = str(StripPC(int(addrs[-1], 16)) + 8)
+  start_addr_dec = str(int(addrs[0], 16))
+  stop_addr_dec = str(int(addrs[-1], 16) + 8)
   cmd = [ToolPath("llvm-objdump"),
          "--section=.text",
          "--demangle",
@@ -394,7 +457,7 @@ def CallObjdumpForSet(lib, unique_addrs):
   current_symbol_addr = 0  # The address of the current function.
   addr_index = 0  # The address that we are currently looking for.
 
-  stream = subprocess.Popen(cmd, stdout=subprocess.PIPE).stdout
+  stream = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True).stdout
   for line in stream:
     # Is it a function line like:
     #   000177b0 <android::IBinder::~IBinder()>:
@@ -419,7 +482,7 @@ def CallObjdumpForSet(lib, unique_addrs):
       addr = components.group(1)
       target_addr = addrs[addr_index]
       i_addr = int(addr, 16)
-      i_target = StripPC(int(target_addr, 16))
+      i_target = int(target_addr, 16)
       if i_addr == i_target:
         result[target_addr] = (current_symbol, i_target - current_symbol_addr)
         addr_cache[target_addr] = result[target_addr]
@@ -435,14 +498,24 @@ def CallCppFilt(mangled_symbol):
   if mangled_symbol in _SYMBOL_DEMANGLING_CACHE:
     return _SYMBOL_DEMANGLING_CACHE[mangled_symbol]
 
-  # TODO: Replace with llvm-cxxfilt when available.
   global _CACHED_CXX_FILT
   if not _CACHED_CXX_FILT:
-    os_name = platform.system().lower()
-    toolchains = glob.glob("%s/prebuilts/gcc/%s-*/host/*-linux-*/bin/*c++filt" %
-                           (ANDROID_BUILD_TOP, os_name))
+    toolchains = None
+    clang_dir = FindClangDir()
+    if clang_dir:
+      if os.path.exists(clang_dir + "/bin/llvm-cxxfilt"):
+        toolchains = [clang_dir + "/bin/llvm-cxxfilt"]
+      else:
+        raise Exception("bin/llvm-cxxfilt missing from " + clang_dir)
+    else:
+      # When run in CI, we don't have a way to find the clang version.  But
+      # llvm-cxxfilt should be available in the following relative path.
+      toolchains = glob.glob("./clang-r*/bin/llvm-cxxfilt")
+      if toolchains and len(toolchains) != 1:
+        raise Exception("Expected one llvm-cxxfilt but found many: " + \
+                        ", ".join(toolchains))
     if not toolchains:
-      raise Exception("Could not find gcc c++filt tool")
+      raise Exception("Could not find llvm-cxxfilt tool")
     _CACHED_CXX_FILT = sorted(toolchains)[-1]
 
   cmd = [_CACHED_CXX_FILT]
@@ -463,264 +536,123 @@ def FormatSymbolWithOffset(symbol, offset):
     return symbol
   return "%s+%d" % (symbol, offset)
 
+def FormatSymbolWithoutParameters(symbol):
+  """Remove parameters from function.
 
-def GetAbiFromToolchain(toolchain_var, bits):
-  toolchain = os.environ.get(toolchain_var)
-  if not toolchain:
-    return None
+  Rather than trying to parse the demangled C++ signature,
+  it just removes matching top level parenthesis.
+  """
+  if not symbol:
+    return symbol
 
-  toolchain_match = re.search("\/(aarch64|arm|mips|x86)\/", toolchain)
-  if toolchain_match:
-    abi = toolchain_match.group(1)
-    if abi == "aarch64":
-      return "arm64"
-    elif bits == 64:
-      if abi == "x86":
-        return "x86_64"
-      elif abi == "mips":
-        return "mips64"
-    return abi
-  return None
+  result = symbol
+  result = result.replace(") const", ")")                  # Strip const keyword.
+  result = result.replace("operator<<", "operator\u00AB")  # Avoid unmatched '<'.
+  result = result.replace("operator>>", "operator\u00BB")  # Avoid unmatched '>'.
+  result = result.replace("operator->", "operator\u2192")  # Avoid unmatched '>'.
 
-def Get32BitArch():
-  # Check for ANDROID_TOOLCHAIN_2ND_ARCH first, if set, use that.
-  # If not try ANDROID_TOOLCHAIN to find the arch.
-  # If this is not set, then default to arm.
-  arch = GetAbiFromToolchain("ANDROID_TOOLCHAIN_2ND_ARCH", 32)
-  if not arch:
-    arch = GetAbiFromToolchain("ANDROID_TOOLCHAIN", 32)
-    if not arch:
-      return "arm"
-  return arch
+  nested = []  # Keeps tract of current nesting level of parenthesis.
+  for i in reversed(range(len(result))):  # Iterate backward to make cutting easier.
+    c = result[i]
+    if c == ')' or c == '>':
+      if len(nested) == 0:
+        end = i + 1  # Mark the end of top-level pair.
+      nested.append(c)
+    if c == '(' or c == '<':
+      if len(nested) == 0 or {')':'(', '>':'<'}[nested.pop()] != c:
+        return symbol  # Malformed: character does not match its pair.
+      if len(nested) == 0 and c == '(' and (end - i) > 2:
+        result = result[:i] + result[end:]  # Remove substring (i, end).
+  if len(nested) > 0:
+    return symbol  # Malformed: missing pair.
 
-def Get64BitArch():
-  # Check for ANDROID_TOOLCHAIN, if it is set, we can figure out the
-  # arch this way. If this is not set, then default to arm64.
-  arch = GetAbiFromToolchain("ANDROID_TOOLCHAIN", 64)
-  if not arch:
-    return "arm64"
-  return arch
+  return result.strip()
 
-def SetAbi(lines):
-  global ARCH
+def SetBitness(lines):
+  global ARCH_IS_32BIT
 
-  abi_line = re.compile("ABI: \'(.*)\'")
   trace_line = re.compile("\#[0-9]+[ \t]+..[ \t]+([0-9a-f]{8}|[0-9a-f]{16})([ \t]+|$)")
   asan_trace_line = re.compile("\#[0-9]+[ \t]+0x([0-9a-f]+)[ \t]+")
 
-  ARCH = None
+  ARCH_IS_32BIT = False
   for line in lines:
-    abi_match = abi_line.search(line)
-    if abi_match:
-      ARCH = abi_match.group(1)
-      break
     trace_match = trace_line.search(line)
     if trace_match:
       # Try to guess the arch, we know the bitness.
       if len(trace_match.group(1)) == 16:
-        ARCH = Get64BitArch()
+        ARCH_IS_32BIT = False
       else:
-        ARCH = Get32BitArch()
+        ARCH_IS_32BIT = True
       break
     asan_trace_match = asan_trace_line.search(line)
     if asan_trace_match:
       # We might be able to guess the bitness by the length of the address.
       if len(asan_trace_match.group(1)) > 8:
-        ARCH = Get64BitArch()
+        ARCH_IS_32BIT = False
         # We know for a fact this is 64 bit, so we are done.
         break
       else:
-        ARCH = Get32BitArch()
         # This might be 32 bit, or just a small address. Keep going in this
         # case, but if we couldn't figure anything else out, go with 32 bit.
-  if not ARCH:
-    raise Exception("Could not determine arch from input, use --arch=XXX to specify it")
+        ARCH_IS_32BIT = True
 
-
-class FindToolchainTests(unittest.TestCase):
-  def assert_toolchain_found(self, abi):
-    global ARCH
-    ARCH = abi
-    FindToolchain() # Will throw on failure.
-
+class FindClangDirTests(unittest.TestCase):
   @unittest.skipIf(ANDROID_BUILD_TOP == '.', 'Test only supported in an Android tree.')
-  def test_toolchains_found(self):
-    self.assert_toolchain_found("arm")
-    self.assert_toolchain_found("arm64")
-    self.assert_toolchain_found("mips")
-    self.assert_toolchain_found("x86")
-    self.assert_toolchain_found("x86_64")
+  def test_clang_dir_found(self):
+    self.assertIsNotNone(FindClangDir())
 
-class SetArchTests(unittest.TestCase):
-  def test_abi_check(self):
-    global ARCH
+class SetBitnessTests(unittest.TestCase):
+  def test_32bit_check(self):
+    global ARCH_IS_32BIT
 
-    SetAbi(["ABI: 'arm'"])
-    self.assertEqual(ARCH, "arm")
-    SetAbi(["ABI: 'arm64'"])
-    self.assertEqual(ARCH, "arm64")
+    SetBitness(["#00 pc 000374e0"])
+    self.assertTrue(ARCH_IS_32BIT)
 
-    SetAbi(["ABI: 'mips'"])
-    self.assertEqual(ARCH, "mips")
-    SetAbi(["ABI: 'mips64'"])
-    self.assertEqual(ARCH, "mips64")
+  def test_64bit_check(self):
+    global ARCH_IS_32BIT
 
-    SetAbi(["ABI: 'x86'"])
-    self.assertEqual(ARCH, "x86")
-    SetAbi(["ABI: 'x86_64'"])
-    self.assertEqual(ARCH, "x86_64")
-
-  def test_32bit_trace_line_toolchain(self):
-    global ARCH
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/arm/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "arm")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/mips/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "mips")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/x86/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "x86")
-
-  def test_32bit_trace_line_toolchain_2nd(self):
-    global ARCH
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN_2ND_ARCH"] = "linux-x86/arm/arm-linux-androideabi-4.9/bin"
-    os.environ["ANDROID_TOOLCHAIN_ARCH"] = "linux-x86/aarch64/aarch64-linux-android-4.9/bin"
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "arm")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN_2ND_ARCH"] = "linux-x86/mips/mips-linux-androideabi-4.9/bin"
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/unknown/unknown-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "mips")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN_2ND_ARCH"] = "linux-x86/x86/x86-linux-androideabi-4.9/bin"
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/unknown/unknown-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "x86")
-
-  def test_64bit_trace_line_toolchain(self):
-    global ARCH
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/aarch/aarch-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 00000000000374e0"])
-    self.assertEqual(ARCH, "arm64")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/mips/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 00000000000374e0"])
-    self.assertEqual(ARCH, "mips64")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/x86/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#00 pc 00000000000374e0"])
-    self.assertEqual(ARCH, "x86_64")
-
-  def test_trace_default_abis(self):
-    global ARCH
-
-    os.environ.clear()
-    SetAbi(["#00 pc 000374e0"])
-    self.assertEqual(ARCH, "arm")
-    SetAbi(["#00 pc 00000000000374e0"])
-    self.assertEqual(ARCH, "arm64")
+    SetBitness(["#00 pc 00000000000374e0"])
+    self.assertFalse(ARCH_IS_32BIT)
 
   def test_32bit_asan_trace_line_toolchain(self):
-    global ARCH
+    global ARCH_IS_32BIT
 
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/arm/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#10 0xb5eeba5d  (/system/vendor/lib/egl/libGLESv1_CM_adreno.so+0xfa5d)"])
-    self.assertEqual(ARCH, "arm")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/mips/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#10 0xb5eeba5d  (/system/vendor/lib/egl/libGLESv1_CM_adreno.so+0xfa5d)"])
-    self.assertEqual(ARCH, "mips")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/x86/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#10 0xb5eeba5d  (/system/vendor/lib/egl/libGLESv1_CM_adreno.so+0xfa5d)"])
-    self.assertEqual(ARCH, "x86")
-
-  def test_32bit_asan_trace_line_toolchain_2nd(self):
-    global ARCH
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN_2ND_ARCH"] = "linux-x86/arm/arm-linux-androideabi-4.9/bin"
-    os.environ["ANDROID_TOOLCHAIN_ARCH"] = "linux-x86/aarch64/aarch64-linux-android-4.9/bin"
-    SetAbi(["#3 0xae1725b5  (/system/vendor/lib/libllvm-glnext.so+0x6435b5)"])
-    self.assertEqual(ARCH, "arm")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN_2ND_ARCH"] = "linux-x86/mips/mips-linux-androideabi-4.9/bin"
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/unknown/unknown-linux-androideabi-4.9/bin"
-    SetAbi(["#3 0xae1725b5  (/system/vendor/lib/libllvm-glnext.so+0x6435b5)"])
-    self.assertEqual(ARCH, "mips")
-
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN_2ND_ARCH"] = "linux-x86/x86/x86-linux-androideabi-4.9/bin"
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/unknown/unknown-linux-androideabi-4.9/bin"
-    SetAbi(["#3 0xae1725b5  (/system/vendor/lib/libllvm-glnext.so+0x6435b5)"])
-    self.assertEqual(ARCH, "x86")
+    SetBitness(["#10 0xb5eeba5d  (/system/vendor/lib/egl/libGLESv1_CM_adreno.so+0xfa5d)"])
+    self.assertTrue(ARCH_IS_32BIT)
 
   def test_64bit_asan_trace_line_toolchain(self):
-    global ARCH
+    global ARCH_IS_32BIT
 
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/aarch/aarch-linux-androideabi-4.9/bin"
-    SetAbi(["#0 0x11b35d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)"])
-    self.assertEqual(ARCH, "arm64")
+    SetBitness(["#12 0x5d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)",
+                "#12 0x11b35d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)"])
+    self.assertFalse(ARCH_IS_32BIT)
 
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/mips/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#1 0x11b35d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)"])
-    self.assertEqual(ARCH, "mips64")
+class FormatSymbolWithoutParametersTests(unittest.TestCase):
+  def test_c(self):
+    self.assertEqual(FormatSymbolWithoutParameters("foo"), "foo")
+    self.assertEqual(FormatSymbolWithoutParameters("foo+42"), "foo+42")
 
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/x86/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#12 0x11b35d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)"])
-    self.assertEqual(ARCH, "x86_64")
+  def test_simple(self):
+    self.assertEqual(FormatSymbolWithoutParameters("foo(int i)"), "foo")
+    self.assertEqual(FormatSymbolWithoutParameters("foo(int i)+42"), "foo+42")
+    self.assertEqual(FormatSymbolWithoutParameters("bar::foo(int i)+42"), "bar::foo+42")
+    self.assertEqual(FormatSymbolWithoutParameters("operator()"), "operator()")
 
-    # Verify that if an address that might be 32 bit comes first, that
-    # encountering a 64 bit address returns a 64 bit abi.
-    ARCH = None
-    os.environ.clear()
-    os.environ["ANDROID_TOOLCHAIN"] = "linux-x86/x86/arm-linux-androideabi-4.9/bin"
-    SetAbi(["#12 0x5d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)",
-            "#12 0x11b35d33bf  (/system/lib/libclang_rt.asan-arm-android.so+0x823bf)"])
-    self.assertEqual(ARCH, "x86_64")
+  def test_templates(self):
+    self.assertEqual(FormatSymbolWithoutParameters("bar::foo<T>(vector<T>& v)"), "bar::foo<T>")
+    self.assertEqual(FormatSymbolWithoutParameters("bar<T>::foo(vector<T>& v)"), "bar<T>::foo")
+    self.assertEqual(FormatSymbolWithoutParameters("bar::foo<T>(vector<T<U>>& v)"), "bar::foo<T>")
+    self.assertEqual(FormatSymbolWithoutParameters("bar::foo<(EnumType)0>(vector<(EnumType)0>& v)"),
+                                                   "bar::foo<(EnumType)0>")
 
-  def test_asan_trace_default_abis(self):
-    global ARCH
+  def test_nested(self):
+    self.assertEqual(FormatSymbolWithoutParameters("foo(int i)::bar(int j)"), "foo::bar")
 
-    os.environ.clear()
-    SetAbi(["#4 0x1234349ab  (/system/vendor/lib/libllvm-glnext.so+0x64fc4f)"])
-    self.assertEqual(ARCH, "arm64")
-    SetAbi(["#1 0xae17ec4f  (/system/vendor/lib/libllvm-glnext.so+0x64fc4f)"])
-    self.assertEqual(ARCH, "arm")
-
-  def test_no_abi(self):
-    global ARCH
-
-    # Python2 vs Python3 compatibility: Python3 warns on Regexp deprecation, but Regex
-    #                                   does not provide that name.
-    if not hasattr(unittest.TestCase, 'assertRaisesRegex'):
-      unittest.TestCase.assertRaisesRegex = getattr(unittest.TestCase, 'assertRaisesRegexp')
-    self.assertRaisesRegex(Exception,
-                           "Could not determine arch from input, use --arch=XXX to specify it",
-                           SetAbi, [])
+  def test_unbalanced(self):
+    self.assertEqual(FormatSymbolWithoutParameters("foo(bar(int i)"), "foo(bar(int i)")
+    self.assertEqual(FormatSymbolWithoutParameters("foo)bar(int i)"), "foo)bar(int i)")
+    self.assertEqual(FormatSymbolWithoutParameters("foo<bar(int i)"), "foo<bar(int i)")
+    self.assertEqual(FormatSymbolWithoutParameters("foo>bar(int i)"), "foo>bar(int i)")
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

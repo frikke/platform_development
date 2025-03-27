@@ -16,12 +16,14 @@
 #
 
 import argparse
+from collections import defaultdict
 import glob
 import json
 import logging
 import os
 import sys
 
+import collect_licenses
 import utils
 
 
@@ -67,27 +69,6 @@ class GenBuildFile(object):
         'vndkproduct.libraries.txt',
     ]
 
-    """Some vendor prebuilts reference libprotobuf-cpp-lite.so and
-    libprotobuf-cpp-full.so and expect the 3.0.0-beta3 version.
-    The new version of protobuf will be installed as
-    /vendor/lib64/libprotobuf-cpp-lite-3.9.1.so.  The VNDK doesn't
-    help here because we compile old devices against the current
-    branch and not an old VNDK snapshot.  We need to continue to
-    provide a vendor libprotobuf-cpp-lite.so until all products in
-    the current branch get updated prebuilts or are obsoleted.
-
-    VENDOR_COMPAT is a dictionary that has VNDK versions as keys and
-    the list of (library name string, shared libs list) as values.
-    """
-    VENDOR_COMPAT = {
-        28: [
-            ('libprotobuf-cpp-lite',
-                ['libc++', 'libc', 'libdl', 'liblog', 'libm', 'libz']),
-            ('libprotobuf-cpp-full',
-                ['libc++', 'libc', 'libdl', 'liblog', 'libm', 'libz']),
-        ]
-    }
-
     def __init__(self, install_dir, vndk_version):
         """GenBuildFile constructor.
 
@@ -102,6 +83,8 @@ class GenBuildFile(object):
         self._snapshot_archs = utils.get_snapshot_archs(install_dir)
         self._root_bpfile = os.path.join(install_dir, utils.ROOT_BP_PATH)
         self._common_bpfile = os.path.join(install_dir, utils.COMMON_BP_PATH)
+        self._llndk = self._parse_lib_list(
+            os.path.basename(self._etc_paths['llndk.libraries.txt']))
         self._vndk_core = self._parse_lib_list(
             os.path.basename(self._etc_paths['vndkcore.libraries.txt']))
         self._vndk_sp = self._parse_lib_list(
@@ -111,6 +94,10 @@ class GenBuildFile(object):
         self._vndk_product = self._parse_lib_list(
             os.path.basename(self._etc_paths['vndkproduct.libraries.txt']))
         self._modules_with_notice = self._get_modules_with_notice()
+        self._license_in_json = not self._modules_with_notice
+        self._license_kinds_map = defaultdict(set)
+        self._license_texts_map = defaultdict(set)
+        self.modules_with_restricted_lic = set()
 
     def _get_etc_paths(self):
         """Returns a map of relative file paths for each ETC module."""
@@ -161,15 +148,12 @@ class GenBuildFile(object):
         for prebuilt in self.ETC_MODULES:
             prebuilt_buildrules.append(self._gen_etc_prebuilt(prebuilt))
 
-        if self._vndk_version in self.VENDOR_COMPAT:
-            prebuilt_buildrules.append('// Defining prebuilt libraries '
-                        'for the compatibility of old vendor modules')
-            for vendor_compat_lib_info in self.VENDOR_COMPAT[self._vndk_version]:
-                prebuilt_buildrules.append(
-                    self._gen_prebuilt_library_shared(vendor_compat_lib_info))
-
         with open(self._root_bpfile, 'w') as bpfile:
             bpfile.write(self._gen_autogen_msg('/'))
+            bpfile.write('\n')
+            bpfile.write(self._gen_license_package())
+            bpfile.write('\n')
+            bpfile.write(self._gen_license())
             bpfile.write('\n')
             bpfile.write('\n'.join(prebuilt_buildrules))
             bpfile.write('\n')
@@ -183,9 +167,16 @@ class GenBuildFile(object):
             self._vndk_version))
         with open(self._common_bpfile, 'w') as bpfile:
             bpfile.write(self._gen_autogen_msg('/'))
-            for module in self._modules_with_notice:
-                bpfile.write('\n')
-                bpfile.write(self._gen_notice_filegroup(module))
+            bpfile.write('\n')
+            bpfile.write(self._gen_license_package())
+            if self._license_in_json:
+                for name in self._license_kinds_map:
+                    bpfile.write('\n')
+                    bpfile.write(self._gen_notice_license(name))
+            else:
+                for module in self._modules_with_notice:
+                    bpfile.write('\n')
+                    bpfile.write(self._gen_notice_license(module))
 
     def generate_android_bp(self):
         """Autogenerates Android.bp."""
@@ -232,22 +223,38 @@ class GenBuildFile(object):
             vndk_core_buildrules = self._gen_vndk_shared_prebuilts(
                 self._vndk_core[arch],
                 arch,
+                is_llndk=False,
                 is_vndk_sp=False,
                 is_binder32=is_binder32,
                 module_names=module_names)
             vndk_sp_buildrules = self._gen_vndk_shared_prebuilts(
                 self._vndk_sp[arch],
                 arch,
+                is_llndk=False,
                 is_vndk_sp=True,
                 is_binder32=is_binder32,
                 module_names=module_names)
+            include_llndk = self._vndk_version > 30
+            if include_llndk:
+                llndk_buildrules = self._gen_vndk_shared_prebuilts(
+                    self._llndk[arch],
+                    arch,
+                    is_llndk=True,
+                    is_vndk_sp=False,
+                    is_binder32=is_binder32,
+                    module_names=module_names)
 
             with open(bpfile_path, 'w') as bpfile:
                 bpfile.write(self._gen_autogen_msg('/'))
                 bpfile.write('\n')
+                bpfile.write(self._gen_license_package())
+                bpfile.write('\n')
                 bpfile.write('\n'.join(vndk_core_buildrules))
                 bpfile.write('\n')
                 bpfile.write('\n'.join(vndk_sp_buildrules))
+                if include_llndk:
+                    bpfile.write('\n')
+                    bpfile.write('\n'.join(llndk_buildrules))
 
             variant_include_path = os.path.join(variant_path, 'include')
             include_path = os.path.join(self._install_dir, arch, 'include')
@@ -267,6 +274,69 @@ class GenBuildFile(object):
         return ('{0}{0} THIS FILE IS AUTOGENERATED BY '
                 'development/vndk/snapshot/gen_buildfiles.py\n'
                 '{0}{0} DO NOT EDIT\n'.format(comment_char))
+
+    def _gen_license_package(self):
+        """ Generates license package for VNDK snapshot libs """
+        return ('package {{\n'
+                '{ind}default_applicable_licenses: ["prebuilts_vndk_v{version}_license"],\n'
+                '}}\n'.format(
+                    ind=self.INDENT,
+                    version=self._vndk_version))
+
+    def _get_license_kinds(self, module=''):
+        """ Returns a set of license kinds
+
+        Args:
+          module: module name to find the license kind.
+                  If empty, check all license files.
+        """
+        if self._license_in_json:
+            license_kinds = set()
+            if module == '':
+                # collect all license kinds
+                for kinds in self._license_kinds_map.values():
+                    license_kinds.update(kinds)
+                return license_kinds
+            else:
+                return self._license_kinds_map[module]
+
+        license_collector = collect_licenses.LicenseCollector(self._install_dir)
+        license_collector.run(module)
+        return license_collector.license_kinds
+
+    def _get_license_texts(self, module):
+        if self._license_in_json:
+            return {'{notice_dir}/{license_text}'.format(
+                        notice_dir=utils.NOTICE_FILES_DIR_NAME,
+                        license_text=license_text)
+                        for license_text in self._license_texts_map[module]}
+        else:
+            return {'{notice_dir}/{module}.txt'.format(
+                        notice_dir=utils.NOTICE_FILES_DIR_NAME,
+                        module=module)}
+
+    def _gen_license(self):
+        """ Generates license module.
+
+        It uses license files for all VNDK snapshot libraries in common/NOTICE_FILES directory.
+        """
+        license_kinds = self._get_license_kinds()
+        license_kinds_string = ''
+        for license_kind in sorted(license_kinds):
+            license_kinds_string += '{ind}{ind}"{license_kind}",\n'.format(
+                                    ind=self.INDENT, license_kind=license_kind)
+        return ('license {{\n'
+                '{ind}name: "prebuilts_vndk_v{version}_license",\n'
+                '{ind}visibility: [":__subpackages__"],\n'
+                '{ind}license_kinds: [\n'
+                '{license_kinds}'
+                '{ind}],\n'
+                '{ind}license_text: ["{notice_files}"],\n'
+                '}}\n'.format(
+                    ind=self.INDENT,
+                    version=self._vndk_version,
+                    license_kinds=license_kinds_string,
+                    notice_files=os.path.join(utils.NOTICE_FILES_DIR_PATH, '**', '*')))
 
     def _get_versioned_name(self,
                             prebuilt,
@@ -382,33 +452,59 @@ class GenBuildFile(object):
                                   '}}\n'.format(ind=self.INDENT))
         return cc_prebuilt_libraries
 
-    def _gen_notice_filegroup(self, module):
-        """Generates a notice filegroup build rule for a given module.
+    def _gen_notice_license(self, module):
+        """Generates a notice license build rule for a given module.
+        When genererating each notice license, collect
+        modules_with_restricted_lic, the list of modules that are under the GPL.
 
         Args:
-          notice: string, module name
+          module: string, module name
         """
-        return ('filegroup {{\n'
-                '{ind}name: "{filegroup_name}",\n'
-                '{ind}srcs: ["{notice_dir}/{module}.txt"],\n'
+        def has_restricted_license(license_kinds):
+            for lic in license_kinds:
+                if 'GPL' in lic:
+                    return True
+            return False
+
+        license_kinds = self._get_license_kinds(module)
+        if has_restricted_license(license_kinds):
+            self.modules_with_restricted_lic.add(module)
+        license_kinds_string = ''
+        for license_kind in sorted(license_kinds):
+            license_kinds_string += '{ind}{ind}"{license_kind}",\n'.format(
+                                    ind=self.INDENT, license_kind=license_kind)
+        license_texts = self._get_license_texts(module)
+        license_texts_string = ''
+        for license_text in sorted(license_texts):
+            license_texts_string += '{ind}{ind}"{license_text}",\n'.format(
+                                    ind=self.INDENT, license_text=license_text)
+        return ('license {{\n'
+                '{ind}name: "{license_name}",\n'
+                '{ind}license_kinds: [\n'
+                '{license_kinds}'
+                '{ind}],\n'
+                '{ind}license_text: [\n'
+                '{license_texts}'
+                '{ind}],\n'
                 '}}\n'.format(
                     ind=self.INDENT,
-                    filegroup_name=self._get_notice_filegroup_name(module),
-                    module=module,
-                    notice_dir=utils.NOTICE_FILES_DIR_NAME))
+                    license_name=self._get_notice_license_name(module),
+                    license_kinds=license_kinds_string,
+                    license_texts=license_texts_string))
 
-    def _get_notice_filegroup_name(self, module):
-        """ Gets a notice filegroup module name for a given module.
+    def _get_notice_license_name(self, module):
+        """ Gets a notice license module name for a given module.
 
         Args:
           notice: string, module name.
         """
-        return 'vndk-v{ver}-{module}-notice'.format(
+        return 'vndk-v{ver}-{module}-license'.format(
             ver=self._vndk_version, module=module)
 
     def _gen_vndk_shared_prebuilts(self,
                                    prebuilts,
                                    arch,
+                                   is_llndk,
                                    is_vndk_sp,
                                    is_binder32,
                                    module_names):
@@ -417,54 +513,89 @@ class GenBuildFile(object):
         Args:
           prebuilts: list of VNDK shared prebuilts
           arch: string, VNDK snapshot arch (e.g. 'arm64')
+          is_llndk: bool, True if the prebuilts are LLNDK stubs
           is_vndk_sp: bool, True if prebuilts are VNDK_SP libs
           is_binder32: bool, True if binder interface is 32-bit
           module_names: dict, module names for given prebuilts
         """
 
-        build_rules = []
+        module_prebuilts = dict()
         for prebuilt in prebuilts:
+            if prebuilt in module_names:
+                name = module_names[prebuilt]
+            else:
+                name = os.path.splitext(prebuilt)[0]
+
+            if name not in module_prebuilts:
+                module_prebuilts[name] = list()
+            module_prebuilts[name].append(prebuilt)
+
+        build_rules = []
+        for name in module_prebuilts:
             bp_module = self._gen_vndk_shared_prebuilt(
-                prebuilt,
+                name,
                 arch,
+                srcs=module_prebuilts[name],
+                is_llndk=is_llndk,
                 is_vndk_sp=is_vndk_sp,
-                is_binder32=is_binder32,
-                module_names=module_names)
+                is_binder32=is_binder32)
             if bp_module:
                 build_rules.append(bp_module)
         return build_rules
 
     def _gen_vndk_shared_prebuilt(self,
-                                  prebuilt,
+                                  name,
                                   arch,
+                                  srcs,
+                                  is_llndk,
                                   is_vndk_sp,
-                                  is_binder32,
-                                  module_names):
-        """Returns build rule for given prebuilt, or an empty string if the
-        prebuilt is invalid (e.g. srcs doesn't exist).
+                                  is_binder32):
+        """Returns build rule for given prebuilt module, or an empty
+        string if the module is invalid (e.g. srcs doesn't exist).
 
         Args:
-          prebuilt: string, name of prebuilt object
+          name: string, name of prebuilt module
           arch: string, VNDK snapshot arch (e.g. 'arm64')
+          srcs: list, prebuilt source file names of this module
+          is_llndk: bool, True if prebuilt is a LLNDK stub
           is_vndk_sp: bool, True if prebuilt is a VNDK_SP lib
           is_binder32: bool, True if binder interface is 32-bit
-          module_names: dict, module names for given prebuilts
         """
 
-        def get_notice_file(prebuilt):
-            """Returns build rule for notice file (attribute 'notice').
+        def is_prebuilts_in_list(prebuilts, vndk_list):
+            for prebuilt in prebuilts:
+                if prebuilt in vndk_list:
+                    return True
+            return False
+
+        def get_license_prop(name):
+            """Returns the license prop build rule.
 
             Args:
-              prebuilt: string, name of prebuilt object
+              name: string, name of the module
+            """
+            if name in self._license_kinds_map:
+                return '{ind}licenses: ["{license}"],\n'.format(
+                        ind=self.INDENT,
+                        license=self._get_notice_license_name(name))
+            return ''
+
+        def get_notice_file(prebuilts):
+            """Returns build rule for notice file (attribute 'licenses').
+
+            Args:
+              prebuilts: list, names of prebuilt objects
             """
             notice = ''
-            if prebuilt in self._modules_with_notice:
-                notice = '{ind}notice: ":{notice_filegroup}",\n'.format(
-                    ind=self.INDENT,
-                    notice_filegroup=self._get_notice_filegroup_name(prebuilt))
+            for prebuilt in prebuilts:
+                if prebuilt in self._modules_with_notice:
+                    notice = '{ind}licenses: ["{notice_license}"],\n'.format(
+                        ind=self.INDENT,
+                        notice_license=self._get_notice_license_name(prebuilt))
+                    break
             return notice
 
-        def get_arch_props(prebuilt, arch, src_paths):
+        def get_arch_props(name, arch, srcs_props):
             """Returns build rule for arch specific srcs.
 
             e.g.,
@@ -486,9 +617,9 @@ class GenBuildFile(object):
                 }
 
             Args:
-              prebuilt: string, name of prebuilt object
+              name: string, name of prebuilt module
               arch: string, VNDK snapshot arch (e.g. 'arm64')
-              src_paths: list of string paths, prebuilt source paths
+              srcs_props: dict, prebuilt source paths and corresponding flags
             """
             arch_props = '{ind}arch: {{\n'.format(ind=self.INDENT)
 
@@ -504,26 +635,23 @@ class GenBuildFile(object):
                             dirs=dirs,
                             name=name))
 
-            for src in sorted(src_paths):
+            def rename_generated_dirs(dirs):
+                # Rename out/soong/.intermediates to generated-headers for better readability.
+                return [d.replace(utils.SOONG_INTERMEDIATES_DIR, utils.GENERATED_HEADERS_DIR, 1) for d in dirs]
+
+            for src in sorted(srcs_props.keys()):
                 include_dirs = ''
                 system_include_dirs = ''
                 flags = ''
                 relative_install_path = ''
-                prop_path = os.path.join(src_root, src+'.json')
-                props = dict()
-                try:
-                    with open(prop_path, 'r') as f:
-                        props = json.loads(f.read())
-                    os.unlink(prop_path)
-                except:
-                    # TODO(b/70312118): Parse from soong build system
-                    if prebuilt == 'android.hidl.memory@1.0-impl.so':
-                        props['RelativeInstallPath'] = 'hw'
+                props = srcs_props[src]
                 if 'ExportedDirs' in props:
-                    l = ['include/%s' % d for d in props['ExportedDirs']]
+                    dirs = rename_generated_dirs(props['ExportedDirs'])
+                    l = ['include/%s' % d for d in dirs]
                     include_dirs = list_to_prop_value(l, 'export_include_dirs')
                 if 'ExportedSystemDirs' in props:
-                    l = ['include/%s' % d for d in props['ExportedSystemDirs']]
+                    dirs = rename_generated_dirs(props['ExportedSystemDirs'])
+                    l = ['include/%s' % d for d in dirs]
                     system_include_dirs = list_to_prop_value(l, 'export_system_include_dirs')
                 if 'ExportedFlags' in props:
                     flags = list_to_prop_value(props['ExportedFlags'], 'export_flags')
@@ -532,6 +660,10 @@ class GenBuildFile(object):
                         'relative_install_path: "{path}",\n').format(
                             ind=self.INDENT,
                             path=props['RelativeInstallPath'])
+                if 'LicenseKinds' in props:
+                    self._license_kinds_map[name].update(props['LicenseKinds'])
+                if 'LicenseTexts' in props:
+                    self._license_texts_map[name].update(props['LicenseTexts'])
 
                 arch_props += ('{ind}{ind}{arch}: {{\n'
                                '{include_dirs}'
@@ -555,51 +687,85 @@ class GenBuildFile(object):
         if is_binder32:
             src_root = os.path.join(src_root, utils.BINDER32)
 
-        src_paths = utils.find(src_root, [prebuilt])
+        src_paths = utils.find(src_root, srcs)
         # filter out paths under 'binder32' subdirectory
         src_paths = list(filter(lambda src: not src.startswith(utils.BINDER32),
             src_paths))
-        # This prebuilt is invalid if no srcs are found.
+        # This module is invalid if no srcs are found.
         if not src_paths:
-            logging.info('No srcs found for {}; skipping'.format(prebuilt))
+            logging.info('No srcs found for {}; skipping'.format(name))
             return ""
 
-        if prebuilt in module_names:
-            name = module_names[prebuilt]
-        else:
-            name = os.path.splitext(prebuilt)[0]
-        vendor_available = str(
-            prebuilt not in self._vndk_private[arch]).lower()
         product_available = ''
         # if vndkproduct.libraries.txt is empty, make the VNDKs available to product by default.
-        if not self._vndk_product[arch] or prebuilt in self._vndk_product[arch]:
-            product_available = '{ind}product_available: {available},\n'.format(
-                ind=self.INDENT, available=vendor_available)
-
-        vndk_sp = ''
-        if is_vndk_sp:
-            vndk_sp = '{ind}{ind}support_system_process: true,\n'.format(
+        if is_llndk or not self._vndk_product[arch] or is_prebuilts_in_list(srcs, self._vndk_product[arch]):
+            product_available = '{ind}product_available: true,\n'.format(
                 ind=self.INDENT)
 
-        notice = get_notice_file(prebuilt)
-        arch_props = get_arch_props(prebuilt, arch, src_paths)
+        vndk_props = ''
+        if not is_llndk:
+            vndk_sp = ''
+            if is_vndk_sp:
+                vndk_sp = '{ind}{ind}support_system_process: true,\n'.format(
+                    ind=self.INDENT)
+
+            vndk_private = ''
+            if is_prebuilts_in_list(srcs, self._vndk_private[arch]):
+                vndk_private = '{ind}{ind}private: true,\n'.format(
+                    ind=self.INDENT)
+
+            vndk_props = ('{ind}vndk: {{\n'
+                          '{ind}{ind}enabled: true,\n'
+                          '{vndk_sp}'
+                          '{vndk_private}'
+                          '{ind}}},\n'.format(
+                              ind=self.INDENT,
+                              product_available=product_available,
+                              vndk_sp=vndk_sp,
+                              vndk_private=vndk_private))
+
+        srcs_props = dict()
+        for src in src_paths:
+            props = dict()
+            prop_path = os.path.join(src_root, src+'.json')
+            try:
+                with open(prop_path, 'r') as f:
+                    props = json.loads(f.read())
+                os.unlink(prop_path)
+            except:
+                # TODO(b/70312118): Parse from soong build system
+                if name == 'android.hidl.memory@1.0-impl':
+                    props['RelativeInstallPath'] = 'hw'
+            srcs_props[src] = props
+        arch_props = get_arch_props(name, arch, srcs_props)
+
+        if self._license_in_json:
+            license = get_license_prop(name)
+        else:
+            license = get_notice_file(srcs)
 
         binder32bit = ''
         if is_binder32:
             binder32bit = '{ind}binder32bit: true,\n'.format(ind=self.INDENT)
+
+        min_sdk_version = ''
+        for src, props in srcs_props.items():
+            if 'MinSdkVersion' in props:
+                min_sdk_version = '{ind}min_sdk_version: "{ver}",\n'.format(
+                    ind=self.INDENT,
+                    ver=props['MinSdkVersion'])
+                break
 
         return ('vndk_prebuilt_shared {{\n'
                 '{ind}name: "{name}",\n'
                 '{ind}version: "{ver}",\n'
                 '{ind}target_arch: "{target_arch}",\n'
                 '{binder32bit}'
-                '{ind}vendor_available: {vendor_available},\n'
+                '{ind}vendor_available: true,\n'
                 '{product_available}'
-                '{ind}vndk: {{\n'
-                '{ind}{ind}enabled: true,\n'
-                '{vndk_sp}'
-                '{ind}}},\n'
-                '{notice}'
+                '{vndk_props}'
+                '{min_sdk_version}'
+                '{license}'
                 '{arch_props}'
                 '}}\n'.format(
                     ind=self.INDENT,
@@ -607,10 +773,10 @@ class GenBuildFile(object):
                     ver=self._vndk_version,
                     target_arch=arch,
                     binder32bit=binder32bit,
-                    vendor_available=vendor_available,
                     product_available=product_available,
-                    vndk_sp=vndk_sp,
-                    notice=notice,
+                    vndk_props=vndk_props,
+                    min_sdk_version=min_sdk_version,
+                    license=license,
                     arch_props=arch_props))
 
 
@@ -650,9 +816,11 @@ def main():
     utils.set_logging_config(args.verbose)
 
     buildfile_generator = GenBuildFile(install_dir, vndk_version)
+    # To parse json information, read and generate arch android.bp using
+    # generate_android_bp() first.
+    buildfile_generator.generate_android_bp()
     buildfile_generator.generate_root_android_bp()
     buildfile_generator.generate_common_android_bp()
-    buildfile_generator.generate_android_bp()
 
     logging.info('Done.')
 

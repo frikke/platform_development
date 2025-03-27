@@ -54,13 +54,14 @@
     <uses-feature android:name="android.hardware.camera" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
-    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="23" />
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="24" />
 
     <application android:name="ApiDemosApplication"
             android:label="@string/activity_sample_code"
             android:icon="@drawable/app_sample_code"
             android:hardwareAccelerated="true"
             android:supportsRtl="true"
+            android:enableOnBackInvokedCallback="true"
             android:theme="@android:style/Theme.Material.Light.DarkActionBar">
 
         <!-- This is how we can request a library but still allow the app
@@ -286,16 +287,34 @@
             </intent-filter>
         </activity>
 
+        <activity android:name=".app.KeepClearRects"
+            android:label="@string/activity_keep_clear">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.SAMPLE_CODE" />
+            </intent-filter>
+        </activity>
+
         <activity android:name=".app.PictureInPicture"
                   android:label="@string/activity_picture_in_picture"
                   android:resizeableActivity="true"
                   android:supportsPictureInPicture="true"
+                  android:theme="@style/Theme.NoActionBar"
                   android:configChanges=
                     "screenSize|smallestScreenSize|screenLayout|orientation">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.SAMPLE_CODE" />
             </intent-filter>
+        </activity>
+
+        <activity android:name=".app.ContentPictureInPicture"
+                  android:label="@string/activity_picture_in_picture"
+                  android:resizeableActivity="true"
+                  android:supportsPictureInPicture="true"
+                  android:theme="@style/Theme.NoActionBar"
+                  android:configChanges=
+                    "screenSize|smallestScreenSize|screenLayout|orientation">
         </activity>
 
         <activity android:name=".app.MaxAspectRatio$Square"
@@ -2650,6 +2669,14 @@
             </intent-filter>
         </activity>
 
+        <activity android:name=".view.ViewFrameRateActivity"
+            android:label="Views/Requested Frame Rate">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.SAMPLE_CODE" />
+            </intent-filter>
+        </activity>
+
         <activity android:name=".view.SystemUIModes"
                 android:label="Views/System UI Visibility/System UI Modes"
                 android:uiOptions="splitActionBarWhenNarrow"
@@ -3253,13 +3280,6 @@
             <meta-data android:name="android.nfc.action.TECH_DISCOVERED"
                 android:resource="@xml/filter_nfc"
             />
-        </activity>
-
-        <activity android:name=".nfc.ForegroundNdefPush" android:label="NFC/ForegroundNdefPush">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.SAMPLE_CODE" />
-            </intent-filter>
         </activity>
 
         <activity android:name=".security.KeyStoreUsage" android:label="Security/KeyStore"

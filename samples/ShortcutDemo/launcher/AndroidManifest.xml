@@ -21,7 +21,8 @@
 
     <application android:label="@string/app_title"
         android:resizeableActivity="true">
-        <activity android:name="ShortcutLauncherMain">
+        <activity android:name="ShortcutLauncherMain"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -43,5 +44,11 @@
         <activity android:name="PackageShortcutActivity"
             android:theme="@android:style/Theme.Holo.Light.Dialog">
         </activity>
+        <!--provider entry is a workaround for b/277943394-->
+        <provider
+            xmlns:tools="http://schemas.android.com/tools"
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="com.example.android.pm.shortcutlauncherdemo.androidx-startup"
+            tools:replace="android:authorities" />
     </application>
 </manifest>

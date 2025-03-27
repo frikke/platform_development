@@ -49,7 +49,7 @@ class ABIWrapper {
  public:
   static std::string GetDeclSourceFile(const clang::Decl *decl,
                                        const clang::CompilerInstance *cip,
-                                       const std::string &root_dir);
+                                       const utils::RootDirs &root_dirs);
 
  protected:
   std::string GetCachedDeclSourceFile(const clang::Decl *decl,
@@ -65,13 +65,17 @@ class ABIWrapper {
                               repr::TemplatedArtifactIR *ta,
                               const std::string &source_file);
 
- protected:
   // Shared between FunctionTypeWrapper and FunctionDeclWrapper.
   bool SetupFunctionParameter(repr::CFunctionLikeIR *functionp,
                               const clang::QualType qual_type,
                               bool has_default_arg,
                               const std::string &source_file,
                               bool is_this_parameter = false);
+
+  // Shared between FunctionDeclWrapper, GlobalVarDeclWrapper,
+  // RecordDeclWrapper, and EnumDeclWrapper.
+  void SetupAvailabilityAttrs(repr::HasAvailabilityAttrs *decl_ir,
+                              const clang::Decl *decl);
 
  protected:
   // Type-related functions

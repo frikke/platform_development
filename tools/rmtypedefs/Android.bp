@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 java_binary_host {
     name: "rmtypedefs",
     srcs: ["src/**/*.java"],
     manifest: "etc/manifest.txt",
     wrapper: "etc/rmtypedefs",
     static_libs: [
-        "asm-5.2",
-        "guava-21.0",
+        "guava",
+        "ow2-asm",
     ],
 }

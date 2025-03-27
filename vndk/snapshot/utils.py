@@ -37,7 +37,8 @@ NOTICE_FILES_DIR_NAME = 'NOTICE_FILES'
 NOTICE_FILES_DIR_PATH = os.path.join(COMMON_DIR_PATH, NOTICE_FILES_DIR_NAME)
 BINDER32 = 'binder32'
 MINIMUM_VNDK_VERSION = 28
-
+SOONG_INTERMEDIATES_DIR = 'out/soong/.intermediates'
+GENERATED_HEADERS_DIR = 'generated-headers'
 
 def set_logging_config(verbose_level):
     verbose_map = (logging.WARNING, logging.INFO, logging.DEBUG)
@@ -168,3 +169,25 @@ def fetch_artifact(branch, build, pattern, destination='.'):
         build, pattern, destination
     ]
     check_call(cmd)
+
+
+def get_latest_vndk_bid(branch):
+    """Get the build id of the latest green build of the vndk target
+    from the Android Build Server.
+
+    Args:
+      branch: string, branch to pull build artifacts from
+
+    Returns:
+      string: bid of the latest green build
+    """
+    ab_tool_path = '/google/bin/releases/android/ab/ab.par'
+    cmd = [
+        ab_tool_path, 'lkgb', '--branch', branch, '--target', 'vndk'
+    ]
+
+    # output will be 'branch target build_id status successful'
+    output = check_output(cmd).strip()
+
+    # return build_id from the output
+    return output.split()[2]

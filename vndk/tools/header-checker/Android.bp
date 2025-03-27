@@ -14,6 +14,11 @@
 // limitations under the License.
 //
 
+package {
+    default_team: "trendy_team_treble",
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 cc_defaults {
     name: "header-checker-defaults",
 
@@ -32,7 +37,6 @@ cc_defaults {
     cppflags: [
         "-fno-exceptions",
         "-fno-rtti",
-        "-std=c++14",
     ],
 
     target: {
@@ -46,7 +50,6 @@ cc_defaults {
     ],
 
     compile_multilib: "64",
-    stl: "none",
 }
 
 cc_binary_host {
@@ -59,8 +62,6 @@ cc_binary_host {
     srcs: [
         "src/dumper/abi_wrappers.cpp",
         "src/dumper/ast_processing.cpp",
-        "src/dumper/diagnostic_consumer.cpp",
-        "src/dumper/fake_decl_source.cpp",
         "src/dumper/fixed_argv.cpp",
         "src/dumper/frontend_action.cpp",
         "src/dumper/frontend_action_factory.cpp",
@@ -75,9 +76,7 @@ cc_binary_host {
 
     shared_libs: [
         "libprotobuf-cpp-full",
-        "libLLVM_host",
-        "libclang_cxx_host",
-        "libc++_host",
+        "libclang-cpp_host",
     ],
 }
 
@@ -94,9 +93,7 @@ cc_defaults {
 
     shared_libs: [
         "libprotobuf-cpp-full",
-        "libLLVM_host",
-        "libclang_cxx_host",
-        "libc++_host",
+        "libclang-cpp_host",
     ],
 }
 
@@ -127,6 +124,10 @@ cc_binary_host {
         "src/diff/abi_diff_wrappers.cpp",
         "src/diff/header_abi_diff.cpp",
     ],
+
+    static_libs: [
+        "libjsoncpp",
+    ],
 }
 
 cc_library_host_static {
@@ -145,7 +146,6 @@ cc_library_host_static {
         "src/repr/json/converter.cpp",
         "src/repr/json/ir_dumper.cpp",
         "src/repr/json/ir_reader.cpp",
-        "src/repr/protobuf/converter.cpp",
         "src/repr/protobuf/ir_diff_dumper.cpp",
         "src/repr/protobuf/ir_dumper.cpp",
         "src/repr/protobuf/ir_reader.cpp",
@@ -155,18 +155,18 @@ cc_library_host_static {
         "src/utils/api_level.cpp",
         "src/utils/command_line_utils.cpp",
         "src/utils/config_file.cpp",
-        "src/utils/collect_exported_headers.cpp",
+        "src/utils/source_path_utils.cpp",
         "src/utils/string_utils.cpp",
     ],
 
     static_libs: [
+        "libbase",
         "libheader-checker-proto",
         "libjsoncpp",
     ],
 
     shared_libs: [
-        "libLLVM_host",
-        "libc++_host",
+        "libclang-cpp_host",
         "libprotobuf-cpp-full",
     ],
 
@@ -188,20 +188,23 @@ cc_test_host {
         "src/repr/symbol/exported_symbol_set_test.cpp",
         "src/repr/symbol/version_script_parser_test.cpp",
         "src/utils/api_level_test.cpp",
-        "src/utils/collect_exported_headers_test.cpp",
         "src/utils/config_file_test.cpp",
+        "src/utils/source_path_utils_test.cpp",
         "src/utils/string_utils_test.cpp",
     ],
 
     static_libs: [
+        "libbase",
+        "libgmock",
         "libgtest",
         "libgtest_main",
         "libheader-checker",
+        "libjsoncpp",
+        "liblog",
     ],
 
     shared_libs: [
-        "libLLVM_host",
-        "libc++_host",
+        "libclang-cpp_host",
     ],
 
     test_suites: ["general-tests"],

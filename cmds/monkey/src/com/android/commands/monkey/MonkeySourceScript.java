@@ -245,7 +245,7 @@ public class MonkeySourceScript implements MonkeyEventSource {
             if (line == null) {
                 return i;
             }
-            line.trim();
+            line = line.trim();
             processLine(line);
         }
         return MAX_ONE_TIME_READS;
@@ -262,7 +262,7 @@ public class MonkeySourceScript implements MonkeyEventSource {
         if (line == null) {
             return 0;
         }
-        line.trim();
+        line = line.trim();
         processLine(line);
         return 1;
     }
@@ -485,10 +485,10 @@ public class MonkeySourceScript implements MonkeyEventSource {
                         .addPointer(0, x, y, 1, 5);
                 mQ.addLast(e1);
                 mQ.addLast(e2);
-                mQ.addLast(e2);
+                mQ.addLast(e3);
 
             } catch (NumberFormatException e) {
-                Logger.err.println("// " + e.toString());
+                Logger.err.println("// " + e);
             }
             return;
         }
@@ -580,9 +580,12 @@ public class MonkeySourceScript implements MonkeyEventSource {
                                     y2, 1, 5));
                 }
                 eventTime = SystemClock.uptimeMillis();
-                mQ.addLast(new MonkeyTouchEvent(MotionEvent.ACTION_POINTER_UP)
+                mQ.addLast(new MonkeyTouchEvent(MotionEvent.ACTION_POINTER_UP
+                        | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT))
                         .setDownTime(downTime).setEventTime(eventTime).addPointer(0, x1, y1)
                         .addPointer(1, x2, y2));
+                mQ.addLast(new MonkeyTouchEvent(MotionEvent.ACTION_UP)
+                        .setDownTime(downTime).setEventTime(eventTime).addPointer(0, x1, y1));
             }
         }
 

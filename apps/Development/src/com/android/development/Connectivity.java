@@ -24,69 +24,53 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.SharedPreferences;
-import android.content.pm.PackageManager.NameNotFoundException;
 import android.net.ConnectivityManager;
 import android.net.ConnectivityManager.NetworkCallback;
-import android.net.LinkAddress;
+import android.net.EthernetManager;
+import android.net.IpConfiguration;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.NetworkUtils;
-import android.net.RouteInfo;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiManager;
-import android.os.RemoteException;
 import android.os.Handler;
 import android.os.Message;
 import android.os.IBinder;
 import android.os.INetworkManagementService;
-import android.os.Parcel;
 import android.os.PowerManager;
 import android.os.PowerManager.WakeLock;
 import android.os.ServiceManager;
 import android.os.SystemClock;
-import android.provider.Settings;
 import android.os.Bundle;
-import android.os.connectivity.WifiActivityEnergyInfo;
 import android.text.TextUtils;
 import android.util.Log;
-import android.view.IWindowManager;
+import android.util.SparseArray;
 import android.view.View;
-import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
-import android.widget.CompoundButton;
 import android.widget.EditText;
-import android.widget.Spinner;
 import android.widget.TextView;
-import android.widget.Toast;
-import android.widget.AdapterView.OnItemSelectedListener;
 
-import com.android.internal.telephony.Phone;
 import libcore.io.IoUtils;
 
 import java.io.BufferedReader;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.Proxy;
 import java.net.Socket;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.List;
 import java.util.Random;
 
 import static android.net.ConnectivityManager.CONNECTIVITY_ACTION;
-import static android.net.ConnectivityManager.INET_CONDITION_ACTION;
 import static android.net.NetworkCapabilities.*;
+
+import com.android.internal.util.MessageUtils;
 
 public class Connectivity extends Activity {
     private static final String TAG = "DevToolsConnectivity";
@@ -136,6 +120,7 @@ public class Connectivity extends Activity {
     private PowerManager mPm;
     private ConnectivityManager mCm;
     private INetworkManagementService mNetd;
+    private EthernetManager mEm;
 
     private WifiScanReceiver mScanRecv;
     IntentFilter mIntentFilter;
@@ -280,28 +265,24 @@ public class Connectivity extends Activity {
     private static class DevToolsNetworkCallback extends NetworkCallback {
         private static final String TAG = "DevToolsNetworkCallback";
 
-        public void onPreCheck(Network network) {
-            Log.d(TAG, "onPreCheck: " + network.netId);
-        }
-
         public void onAvailable(Network network) {
-            Log.d(TAG, "onAvailable: " + network.netId);
+            Log.d(TAG, "onAvailable: " + network);
         }
 
         public void onCapabilitiesChanged(Network network, NetworkCapabilities nc) {
-            Log.d(TAG, "onCapabilitiesChanged: " + network.netId + " " + nc.toString());
+            Log.d(TAG, "onCapabilitiesChanged: " + network + " " + nc.toString());
         }
 
         public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
-            Log.d(TAG, "onLinkPropertiesChanged: " + network.netId + " " + lp.toString());
+            Log.d(TAG, "onLinkPropertiesChanged: " + network + " " + lp.toString());
         }
 
         public void onLosing(Network network, int maxMsToLive) {
-            Log.d(TAG, "onLosing: " + network.netId + " " + maxMsToLive);
+            Log.d(TAG, "onLosing: " + network + " " + maxMsToLive);
         }
 
         public void onLost(Network network) {
-            Log.d(TAG, "onLost: " + network.netId);
+            Log.d(TAG, "onLost: " + network);
         }
     }
     private DevToolsNetworkCallback mCallback;
@@ -392,6 +373,33 @@ public class Connectivity extends Activity {
                 progressBar));
     }
 
+    private static class DevToolsEthListener implements EthernetManager.InterfaceStateListener {
+        private static final String TAG = DevToolsEthListener.class.getSimpleName();
+
+        private static final SparseArray<String> STATE_NAMES = MessageUtils.findMessageNames(
+                new Class[]{EthernetManager.class}, new String[]{"STATE_"});
+
+        private static final SparseArray<String> ROLE_NAMES = MessageUtils.findMessageNames(
+                new Class[]{EthernetManager.class}, new String[]{"ROLE_"});
+
+        private String stateName(int state) {
+            return STATE_NAMES.get(state, Integer.toString(state));
+        }
+
+        private String roleName(int role) {
+            return ROLE_NAMES.get(role, Integer.toString(role));
+        }
+
+        @Override
+        public void onInterfaceStateChanged(String iface, int state, int role,
+                IpConfiguration configuration) {
+            Log.d(TAG, iface + " " + stateName(state) + " " + roleName(role)
+                    + " " + configuration);
+        }
+    }
+
+    private final DevToolsEthListener mEthListener = new DevToolsEthListener();
+
     public Connectivity() {
         super();
         addRequestableNetwork(NET_CAPABILITY_MMS, R.id.request_mms, R.id.release_mms,
@@ -426,6 +434,7 @@ public class Connectivity extends Activity {
         mCm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
         mNetd = INetworkManagementService.Stub.asInterface(b);
+        mEm = getSystemService(EthernetManager.class);
 
         findViewById(R.id.enableWifi).setOnClickListener(mClickListener);
         findViewById(R.id.disableWifi).setOnClickListener(mClickListener);
@@ -484,7 +493,6 @@ public class Connectivity extends Activity {
         IntentFilter broadcastFilter = new IntentFilter();
         broadcastFilter.addAction(CONNECTIVITY_ACTION);
         broadcastFilter.addAction(CONNECTIVITY_TEST_ALARM);
-        broadcastFilter.addAction(INET_CONDITION_ACTION);
         broadcastFilter.addAction(NETWORK_CONDITIONS_MEASURED);
 
         registerReceiver(mReceiver, broadcastFilter);
@@ -497,6 +505,8 @@ public class Connectivity extends Activity {
 
         mCallback = new DevToolsNetworkCallback();
         mCm.registerNetworkCallback(mEmptyRequest, mCallback);
+
+        mEm.addInterfaceStateListener(this::runOnUiThread, mEthListener);
     }
 
     @Override
@@ -507,6 +517,7 @@ public class Connectivity extends Activity {
         }
         mCm.unregisterNetworkCallback(mCallback);
         mCallback = null;
+        mEm.removeInterfaceStateListener(mEthListener);
         unregisterReceiver(mReceiver);
         mWml.release();
     }
@@ -620,7 +631,8 @@ public class Connectivity extends Activity {
         i.putExtra(TEST_ALARM_OFF_EXTRA, Long.toString(mSCOffDuration));
         i.putExtra(TEST_ALARM_CYCLE_EXTRA, Integer.toString(mSCCycleCount));
 
-        PendingIntent p = PendingIntent.getBroadcast(this, 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
+        PendingIntent p = PendingIntent.getBroadcast(this, 0, i,
+                PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
 
         am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + delayMs, p);
     }

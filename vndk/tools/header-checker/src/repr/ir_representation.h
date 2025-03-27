@@ -15,9 +15,12 @@
 #ifndef IR_REPRESENTATION_H_
 #define IR_REPRESENTATION_H_
 
+#include "utils/api_level.h"
+
 #include <list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -44,9 +47,14 @@ enum TextFormatIR {
 
 enum CompatibilityStatusIR {
   Compatible = 0,
+  // Changing classes or enums not referenced by functions or variables.
   UnreferencedChanges = 1,
+  // Adding symbols.
+  ElfExtension = 2,
+  // Adding functions, classes, class members, etc.
   Extension = 4,
   Incompatible = 8,
+  // Removing symbols.
   ElfIncompatible = 16
 };
 
@@ -65,6 +73,7 @@ static inline CompatibilityStatusIR operator&(CompatibilityStatusIR f,
 }
 
 enum AccessSpecifierIR {
+  // Ordered from the least to the most restricted.
   PublicAccess = 1,
   ProtectedAccess = 2,
   PrivateAccess = 3
@@ -91,6 +100,16 @@ std::map<V, K> CreateInverseMap(const std::map<K, V> &m) {
     inverse_map[it.second] = it.first;
   }
   return inverse_map;
+}
+
+static inline std::string FormatMultiDefinitionTypeId(
+    const std::string &type_id, const std::string &compilation_unit_path) {
+  return type_id + "#ODR:" + compilation_unit_path;
+}
+
+static inline std::string_view ExtractMultiDefinitionTypeId(
+    std::string_view type_id) {
+  return type_id.substr(0, type_id.find("#ODR:"));
 }
 
 class LinkableMessageIR {
@@ -142,6 +161,45 @@ class ReferencesOtherType {
 
  protected:
   std::string referenced_type_;
+};
+
+class AvailabilityAttrIR {
+ public:
+  void SetIntroduced(uint32_t version) { introduced_major_ = version; }
+
+  std::optional<uint32_t> GetIntroduced() const { return introduced_major_; }
+
+  void SetDeprecated(uint32_t version) { deprecated_major_ = version; }
+
+  std::optional<uint32_t> GetDeprecated() const { return deprecated_major_; }
+
+  void SetObsoleted(uint32_t version) { obsoleted_major_ = version; }
+
+  std::optional<uint32_t> GetObsoleted() const { return obsoleted_major_; }
+
+  void SetUnavailable(bool unavailable) { unavailable_ = unavailable; }
+
+  bool IsUnavailable() const { return unavailable_; }
+
+ private:
+  std::optional<uint32_t> introduced_major_;
+  std::optional<uint32_t> deprecated_major_;
+  std::optional<uint32_t> obsoleted_major_;
+  bool unavailable_ = false;
+};
+
+class HasAvailabilityAttrs {
+ public:
+  void AddAvailabilityAttr(AvailabilityAttrIR &&attr) {
+    availability_attrs_.emplace_back(std::move(attr));
+  }
+
+  const std::vector<AvailabilityAttrIR> &GetAvailabilityAttrs() const {
+    return availability_attrs_;
+  }
+
+ private:
+  std::vector<AvailabilityAttrIR> availability_attrs_;
 };
 
 // TODO: Break this up into types with sizes and those without types?
@@ -316,12 +374,17 @@ class TemplatedArtifactIR {
   TemplateInfoIR template_info_;
 };
 
-class RecordFieldIR : public ReferencesOtherType {
+class RecordFieldIR : public ReferencesOtherType, public HasAvailabilityAttrs {
  public:
   RecordFieldIR(const std::string &name, const std::string &type,
-                uint64_t offset, AccessSpecifierIR access)
-      : ReferencesOtherType(type), name_(name), offset_(offset),
-        access_(access) {}
+                uint64_t offset, AccessSpecifierIR access, bool is_bit_field,
+                uint64_t bit_width)
+      : ReferencesOtherType(type),
+        name_(name),
+        offset_(offset),
+        access_(access),
+        is_bit_field_(is_bit_field),
+        bit_width_(bit_width) {}
 
   RecordFieldIR() {}
 
@@ -337,13 +400,21 @@ class RecordFieldIR : public ReferencesOtherType {
     return access_;
   }
 
+  bool IsBitField() const { return is_bit_field_; }
+
+  uint64_t GetBitWidth() const { return bit_width_; }
+
  protected:
   std::string name_;
   uint64_t offset_ = 0;
   AccessSpecifierIR access_ = AccessSpecifierIR::PublicAccess;
+  bool is_bit_field_ = false;
+  uint64_t bit_width_ = 0;
 };
 
-class RecordTypeIR : public TypeIR, public TemplatedArtifactIR {
+class RecordTypeIR : public TypeIR,
+                     public TemplatedArtifactIR,
+                     public HasAvailabilityAttrs {
  public:
   enum RecordKind {
     struct_kind,
@@ -430,25 +501,40 @@ class RecordTypeIR : public TypeIR, public TemplatedArtifactIR {
   RecordKind record_kind_;
 };
 
-class EnumFieldIR {
+class EnumFieldIR : public HasAvailabilityAttrs {
  public:
-  EnumFieldIR(const std::string &name, int value)
-      : name_(name), value_(value) {}
+  void SetName(std::string name) { name_ = std::move(name); }
 
   const std::string &GetName() const {
     return name_;
   }
 
-  int GetValue() const {
-    return value_;
+  bool IsSigned() const { return is_signed_; }
+
+  void SetSignedValue(int64_t value) {
+    signed_value_ = value;
+    is_signed_ = true;
   }
+
+  int64_t GetSignedValue() const { return signed_value_; }
+
+  void SetUnsignedValue(uint64_t value) {
+    unsigned_value_ = value;
+    is_signed_ = false;
+  }
+
+  uint64_t GetUnsignedValue() const { return unsigned_value_; }
 
  protected:
   std::string name_;
-  int value_ = 0;
+  union {
+    int64_t signed_value_;
+    uint64_t unsigned_value_ = 0;
+  };
+  bool is_signed_ = false;
 };
 
-class EnumTypeIR : public TypeIR {
+class EnumTypeIR : public TypeIR, public HasAvailabilityAttrs {
  public:
   // Add Methods to get information from the IR.
   void AddEnumField(EnumFieldIR &&field) {
@@ -493,9 +579,18 @@ class EnumTypeIR : public TypeIR {
 
 class ArrayTypeIR : public TypeIR {
  public:
+  void SetUnknownBound(bool is_of_unknown_bound) {
+    is_of_unknown_bound_ = is_of_unknown_bound;
+  }
+
+  bool IsOfUnknownBound() const { return is_of_unknown_bound_; }
+
   LinkableMessageKind GetKind() const override {
     return LinkableMessageKind::ArrayTypeKind;
   }
+
+ private:
+  bool is_of_unknown_bound_ = false;
 };
 
 class PointerTypeIR : public TypeIR {
@@ -584,7 +679,9 @@ class QualifiedTypeIR : public TypeIR {
   bool is_volatile_;
 };
 
-class GlobalVarIR : public LinkableMessageIR , public ReferencesOtherType {
+class GlobalVarIR : public LinkableMessageIR,
+                    public ReferencesOtherType,
+                    public HasAvailabilityAttrs {
  public:
   // Add Methods to get information from the IR.
   void SetName(std::string &&name) {
@@ -669,8 +766,10 @@ class FunctionTypeIR : public TypeIR, public CFunctionLikeIR {
   }
 };
 
-class FunctionIR : public LinkableMessageIR, public TemplatedArtifactIR,
-                   public CFunctionLikeIR {
+class FunctionIR : public LinkableMessageIR,
+                   public TemplatedArtifactIR,
+                   public CFunctionLikeIR,
+                   public HasAvailabilityAttrs {
  public:
   void SetAccess(AccessSpecifierIR access) {
     access_ = access;
@@ -768,8 +867,9 @@ class TypeDefinition {
 
 class ModuleIR {
  public:
-  ModuleIR(const std::set<std::string> *exported_headers)
-      : exported_headers_(exported_headers) {}
+  ModuleIR(const std::set<std::string> *exported_headers = nullptr,
+           std::optional<utils::ApiLevel> availability = {})
+      : exported_headers_(exported_headers), availability_(availability) {}
 
   const std::string &GetCompilationUnitPath() const {
     return compilation_unit_path_;
@@ -894,6 +994,11 @@ class ModuleIR {
   bool IsLinkableMessageInExportedHeaders(
       const LinkableMessageIR *linkable_message) const;
 
+  void FilterRecordFields(RecordTypeIR &record_type) const;
+
+  void FilterEnumFields(EnumTypeIR &enum_type) const;
+
+  bool IsAvailable(const HasAvailabilityAttrs &decl_ir) const;
 
  public:
   // File path to the compilation unit (*.sdump)
@@ -922,11 +1027,11 @@ class ModuleIR {
   // maps unique_id + source_file -> TypeDefinition
   AbiElementUnorderedMap<std::list<TypeDefinition>> odr_list_map_;
 
-
  private:
   // The compilation unit paths referenced by odr_list_map_;
   std::set<std::string> compilation_unit_paths_;
   const std::set<std::string> *exported_headers_;
+  const std::optional<utils::ApiLevel> availability_;
 };
 
 

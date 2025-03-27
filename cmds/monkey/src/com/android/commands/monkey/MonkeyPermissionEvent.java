@@ -19,10 +19,11 @@ package com.android.commands.monkey;
 import android.app.ActivityManager;
 import android.app.AppGlobals;
 import android.app.IActivityManager;
+import android.companion.virtual.VirtualDeviceManager;
+import android.content.pm.IPackageManager;
 import android.content.pm.PackageManager;
 import android.content.pm.PermissionInfo;
 import android.os.RemoteException;
-import android.os.ServiceManager;
 import android.permission.IPermissionManager;
 import android.view.IWindowManager;
 
@@ -38,20 +39,22 @@ public class MonkeyPermissionEvent extends MonkeyEvent {
 
     @Override
     public int injectEvent(IWindowManager iwm, IActivityManager iam, int verbose) {
+        final IPackageManager packageManager = AppGlobals.getPackageManager();
         final IPermissionManager permissionManager = AppGlobals.getPermissionManager();
         final int currentUser = ActivityManager.getCurrentUser();
         try {
             // determine if we should grant or revoke permission
-            int perm = permissionManager.checkPermission(mPermissionInfo.name, mPkg, currentUser);
+            int perm = packageManager.checkPermission(mPermissionInfo.name, mPkg, currentUser);
             boolean grant = perm == PackageManager.PERMISSION_DENIED;
             // log before calling pm in case we hit an error
             Logger.out.println(String.format(":Permission %s %s to package %s",
                     grant ? "grant" : "revoke", mPermissionInfo.name, mPkg));
             if (grant) {
-                permissionManager.grantRuntimePermission(mPkg, mPermissionInfo.name, currentUser);
+                permissionManager.grantRuntimePermission(mPkg, mPermissionInfo.name,
+                        VirtualDeviceManager.PERSISTENT_DEVICE_ID_DEFAULT, currentUser);
             } else {
-                permissionManager.revokeRuntimePermission(mPkg, mPermissionInfo.name, currentUser,
-                        null);
+                permissionManager.revokeRuntimePermission(mPkg, mPermissionInfo.name,
+                        VirtualDeviceManager.PERSISTENT_DEVICE_ID_DEFAULT, currentUser, null);
             }
             return MonkeyEvent.INJECT_SUCCESS;
         } catch (RemoteException re) {
